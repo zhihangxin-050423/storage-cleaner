@@ -62,11 +62,19 @@ FONT_SMALL = ("Segoe UI", 9)
 FONT_MONO  = ("Consolas", 9)
 
 # 设置窗口字体（更大一些，避免在高 DPI 下过小）
-FONT_SETTINGS_LABEL = ("Segoe UI", 11)
-FONT_SETTINGS_ENTRY = ("Segoe UI", 11)
+FONT_SETTINGS_LABEL = ("Segoe UI", 12)
+FONT_SETTINGS_ENTRY = ("Segoe UI", 12)
+FONT_SETTINGS_HINT  = ("Segoe UI", 10)
 
 # DeepSeek 模型固定选项（按需求：提供下拉选择）
 DEEPSEEK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
+
+# AI 建议标签颜色
+AI_SUGGESTION_STYLE = {
+    "safe_to_delete": {"fg": "#A6E3A1", "bg": "#1E3A2B", "text": "✅ 可以删除"},
+    "keep": {"fg": "#F38BA8", "bg": "#3A1020", "text": "🔒 建议保留"},
+    "caution": {"fg": "#FAB387", "bg": "#3A2600", "text": "⚠️ 谨慎确认"},
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -479,6 +487,19 @@ class StorageCleanerApp:
 
         tk.Label(detail_frame, text="文件详情", font=FONT_H2,
                  bg=C_PANEL, fg=C_TEXT).pack(anchor="w")
+
+        # AI 建议标签（独立展示，不混在详情文本里）
+        self._ai_tag = tk.Label(
+            detail_frame,
+            text="AI 建议：—",
+            font=FONT_SMALL,
+            bg=C_BG,
+            fg=C_SUBTEXT,
+            padx=10,
+            pady=6,
+            anchor="w",
+        )
+        self._ai_tag.pack(fill="x", pady=(6, 4))
 
         self._detail_text = tk.Text(detail_frame, bg=C_BG, fg=C_TEXT,
                                      font=FONT_SMALL, relief="flat",
@@ -922,6 +943,18 @@ class StorageCleanerApp:
             f"访问时间：{datetime.fromtimestamp(fi.atime).strftime('%Y-%m-%d %H:%M')} "
             f"({_days_str(fi.atime_days_ago)})\n"
         )
+        # 更新 AI 标签
+        sug = (getattr(fi, "ai_suggestion", "") or "").strip()
+        conf = float(getattr(fi, "ai_confidence", 0.0) or 0.0)
+        if sug in AI_SUGGESTION_STYLE:
+            st = AI_SUGGESTION_STYLE[sug]
+            self._ai_tag.configure(
+                text=f"AI 建议：{st['text']}  置信度：{int(conf*100)}%",
+                fg=st["fg"],
+                bg=st["bg"],
+            )
+        else:
+            self._ai_tag.configure(text="AI 建议：—", fg=C_SUBTEXT, bg=C_BG)
         if fi.is_duplicate and fi.duplicate_of:
             text += f"重复源文件：{fi.duplicate_of}\n"
         if fi.hash_md5:
@@ -1009,7 +1042,10 @@ class StorageCleanerApp:
         self._set_ai_text(f"正在分析 {n} 个未知文件，请稍候...")
 
         def worker():
-            results = self.explainer.explain_batch(unknown)
+            def progress(done, total):
+                self._q.put(("batch_ai_progress", done, total))
+
+            results = self.explainer.explain_batch(unknown, progress_callback=progress)
             for fi in unknown:
                 if fi.path in results:
                     fi.ai_explanation = results[fi.path]
@@ -1166,11 +1202,18 @@ class StorageCleanerApp:
             _, fi, explanation = msg
             fi.ai_explanation = explanation
             self._set_ai_text(explanation)
+            # 同步刷新详情区 AI 标签
+            if self._selected_file and self._selected_file.path == fi.path:
+                self._show_file_detail(fi)
             self._ai_btn.configure(state="normal")
 
         elif mtype == "batch_ai_done":
             _, count = msg
             self._set_ai_text(f"AI 分析完成，共分析 {count} 个文件。\n请选中文件查看各自解释。")
+
+        elif mtype == "batch_ai_progress":
+            _, done, total = msg
+            self._set_ai_text(f"批量 AI 分析中：{done}/{total} ...")
 
         elif mtype == "exec_done":
             _, result, processed_files = msg
@@ -1309,22 +1352,63 @@ class SettingsDialog(tk.Toplevel):
         self.explainer = explainer
         self.executor  = executor
         self.title("设置")
-        # 增大高度，避免 API Key 输入框被遮挡
-        self.geometry("560x640")
+        # 默认尺寸；允许用户最大化/拉伸，内容区支持滚动避免遮挡
+        self.geometry("720x760")
         self.configure(bg=C_BG)
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.grab_set()
+
+        # Windows：允许最大化（可选）
+        try:
+            self.state("normal")
+        except Exception:
+            pass
 
         self._build()
 
     def _build(self):
         p = self
-        tk.Label(p, text="⚙ 设置", font=FONT_H1, bg=C_BG, fg=C_TEXT).pack(pady=12)
+
+        # 顶部标题
+        tk.Label(p, text="⚙ 设置", font=FONT_H1, bg=C_BG, fg=C_TEXT).pack(pady=(12, 8))
+
+        # 可滚动内容区（避免小屏/高 DPI 遮挡）
+        outer = tk.Frame(p, bg=C_BG)
+        outer.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        canvas = tk.Canvas(outer, bg=C_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        content = tk.Frame(canvas, bg=C_BG)
+        content_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _on_configure(_evt=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # 让内部 frame 宽度跟随 canvas
+            try:
+                canvas.itemconfigure(content_id, width=canvas.winfo_width())
+            except Exception:
+                pass
+
+        content.bind("<Configure>", _on_configure)
+        canvas.bind("<Configure>", _on_configure)
+
+        # 鼠标滚轮滚动
+        def _on_mousewheel(evt):
+            try:
+                # Windows: delta 是 120 的倍数
+                canvas.yview_scroll(int(-1 * (evt.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # LLM 配置
-        frame1 = tk.LabelFrame(p, text="大模型（LLM）配置", bg=C_BG,
+        frame1 = tk.LabelFrame(content, text="大模型（LLM）配置", bg=C_BG,
                                 fg=C_TEXT, font=FONT_BODY)
-        frame1.pack(fill="x", padx=20, pady=6)
+        frame1.pack(fill="x", padx=8, pady=8)
 
         # Provider
         from config import LLMProvider, DEFAULT_LLM_MODELS, DEFAULT_OPENAI_BASE_URL, DEFAULT_DEEPSEEK_BASE_URL
@@ -1348,8 +1432,11 @@ class SettingsDialog(tk.Toplevel):
                               bg=C_BTN, fg=C_TEXT, font=FONT_SETTINGS_ENTRY, relief="flat",
                               width=50, bd=4)
         base_entry.pack(padx=8, pady=(2, 6), fill="x")
-        tk.Label(frame1, text="提示：ChatGPT 默认 https://api.openai.com；DeepSeek(OpenAI兼容) 默认 https://api.deepseek.com；DeepSeek(Anthropic兼容) 可填 https://api.deepseek.com/anthropic。",
-                 bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8, pady=(0, 6))
+        tk.Label(
+            frame1,
+            text="提示：ChatGPT 默认 https://api.openai.com；DeepSeek(OpenAI兼容) 默认 https://api.deepseek.com；DeepSeek(Anthropic兼容) 可填 https://api.deepseek.com/anthropic。",
+            bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_HINT, wraplength=660, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0, 8))
 
         # Extra params（JSON，可选，用于 OpenAI/DeepSeek 扩展字段透传）
         self._extra_var = tk.StringVar(value=json.dumps(getattr(self.explainer, "extra_params", {}) or {}, ensure_ascii=False))
@@ -1358,8 +1445,11 @@ class SettingsDialog(tk.Toplevel):
                                bg=C_BTN, fg=C_TEXT, font=FONT_SETTINGS_ENTRY, relief="flat",
                                width=50, bd=4)
         extra_entry.pack(padx=8, pady=(2, 6), fill="x")
-        tk.Label(frame1, text="示例：{\"reasoning_effort\":\"high\",\"extra_body\":{\"thinking\":{\"type\":\"enabled\"}}}",
-                 bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8, pady=(0, 6))
+        tk.Label(
+            frame1,
+            text="示例：{\"reasoning_effort\":\"high\",\"extra_body\":{\"thinking\":{\"type\":\"enabled\"}}}",
+            bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_HINT, wraplength=660, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0, 8))
 
         # API Key
         self._api_var = tk.StringVar(value=self.explainer.api_key)
@@ -1368,8 +1458,11 @@ class SettingsDialog(tk.Toplevel):
                          bg=C_BTN, fg=C_TEXT, font=FONT_SETTINGS_ENTRY, relief="flat",
                          width=50, bd=4)
         entry.pack(padx=8, pady=(2, 6), fill="x")
-        tk.Label(frame1, text="（也可设置环境变量：OPENAI_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY）",
-                 bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8, pady=(0, 6))
+        tk.Label(
+            frame1,
+            text="（也可设置环境变量：OPENAI_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY）",
+            bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_HINT, wraplength=660, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0, 8))
 
         def _sync_defaults(*_):
             # 切换 provider 时自动填充常用默认值（不覆盖用户手动输入过的非空值）
@@ -1398,25 +1491,28 @@ class SettingsDialog(tk.Toplevel):
         _sync_defaults()
 
         # 删除模式
-        frame2 = tk.LabelFrame(p, text="删除模式", bg=C_BG,
+        frame2 = tk.LabelFrame(content, text="删除模式", bg=C_BG,
                                 fg=C_TEXT, font=FONT_BODY)
-        frame2.pack(fill="x", padx=20, pady=6)
+        frame2.pack(fill="x", padx=8, pady=8)
 
         self._trash_var = tk.BooleanVar(value=self.executor.use_trash)
         tk.Checkbutton(frame2, text="默认使用回收站（推荐，可恢复）",
                        variable=self._trash_var,
                        bg=C_BG, fg=C_TEXT, selectcolor=C_ACCENT,
-                       activebackground=C_BG, font=FONT_BODY).pack(anchor="w", padx=8, pady=4)
+                       activebackground=C_BG, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8, pady=6)
 
         # 日志
-        frame3 = tk.LabelFrame(p, text="操作日志", bg=C_BG,
+        frame3 = tk.LabelFrame(content, text="操作日志", bg=C_BG,
                                 fg=C_TEXT, font=FONT_BODY)
-        frame3.pack(fill="x", padx=20, pady=6)
-        tk.Label(frame3, text=f"日志保存路径：{OPERATION_LOG_PATH}",
-                 bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8, pady=4)
+        frame3.pack(fill="x", padx=8, pady=8)
+        tk.Label(
+            frame3,
+            text=f"日志保存路径：{OPERATION_LOG_PATH}",
+            bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_HINT, wraplength=660, justify="left"
+        ).pack(anchor="w", padx=8, pady=6)
 
         # 按钮
-        btns = tk.Frame(p, bg=C_BG)
+        btns = tk.Frame(content, bg=C_BG)
         btns.pack(pady=12)
         _make_btn(btns, "保存", self._save, bg=C_ACCENT, fg="white").pack(side="left", padx=8)
         _make_btn(btns, "取消", self.destroy, bg=C_BTN).pack(side="left", padx=8)

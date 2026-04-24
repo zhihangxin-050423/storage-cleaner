@@ -41,6 +41,8 @@ class FileInfo:
     risk_level:    str          = ""   # "低风险" / "中风险" / "高风险"
     risk_reason:   str          = ""   # 规则引擎给出的原因
     ai_explanation:str          = ""   # LLM 生成的解释
+    ai_suggestion: str          = ""   # "safe_to_delete" | "keep" | "caution" | ""
+    ai_confidence: float        = 0.0  # 0.0 ~ 1.0
 
     # 重复文件信息
     is_duplicate:  bool         = False
