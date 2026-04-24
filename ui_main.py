@@ -61,6 +61,13 @@ FONT_BODY  = ("Segoe UI", 10)
 FONT_SMALL = ("Segoe UI", 9)
 FONT_MONO  = ("Consolas", 9)
 
+# 设置窗口字体（更大一些，避免在高 DPI 下过小）
+FONT_SETTINGS_LABEL = ("Segoe UI", 11)
+FONT_SETTINGS_ENTRY = ("Segoe UI", 11)
+
+# DeepSeek 模型固定选项（按需求：提供下拉选择）
+DEEPSEEK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 帮助函数
@@ -136,6 +143,8 @@ class StorageCleanerApp:
         self._scan_thread: Optional[threading.Thread]  = None
         self._scanning     = False
         self._selected_file: Optional[FileInfo]        = None
+        self._scan_total_est: int = 0
+        self._scan_phase: str = ""  # "counting" | "scanning" | "hashing"
 
         # 筛选状态
         self._filter_risk    = tk.StringVar(value="全部")
@@ -201,7 +210,7 @@ class StorageCleanerApp:
                   bg=C_BTN).pack(side="right", padx=12)
 
         # 进度条（默认隐藏）
-        self._progress = ttk.Progressbar(bar, mode="indeterminate", length=160)
+        self._progress = ttk.Progressbar(bar, mode="indeterminate", length=220)
         self._progress.pack(side="right", padx=8)
         self._progress.pack_forget()
 
@@ -483,9 +492,9 @@ class StorageCleanerApp:
 
         ai_hdr = tk.Frame(ai_frame, bg=C_PANEL)
         ai_hdr.pack(fill="x")
-        tk.Label(ai_hdr, text="🤖 AI 解释", font=FONT_H2,
+        tk.Label(ai_hdr, text="🤖 智能分析", font=FONT_H2,
                  bg=C_PANEL, fg=C_ACCENT).pack(side="left")
-        self._ai_btn = _make_btn(ai_hdr, "获取 AI 分析", self._get_ai_explanation,
+        self._ai_btn = _make_btn(ai_hdr, "获取智能分析报告", self._get_ai_explanation,
                                   bg=C_ACCENT, fg="white", font=FONT_SMALL)
         self._ai_btn.pack(side="right")
         _make_btn(ai_hdr, "批量分析未知文件", self._batch_ai_unknown,
@@ -594,9 +603,12 @@ class StorageCleanerApp:
         self._scanning = True
         self._scan_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
-        self._status_var.set("正在扫描...")
+        self._status_var.set("正在预统计文件数量...")
         self._progress.pack(side="right", padx=8)
+        self._progress.configure(mode="indeterminate", maximum=100, value=0)
         self._progress.start(10)
+        self._scan_total_est = 0
+        self._scan_phase = "counting"
 
         # 清空旧数据
         self._clear_display()
@@ -614,6 +626,12 @@ class StorageCleanerApp:
     def _scan_worker(self, path: str):
         """后台扫描线程"""
         try:
+            # 第 0 步：预统计文件数量，用于确定型进度条
+            total = self.scanner.estimate_total_files(path, skip_system=True)
+            self._q.put(("scan_total", total))
+            if self.scanner._cancel_flag.is_set():
+                self._q.put(("scan_error", "已取消"))
+                return
             result = self.scanner.scan(path, skip_system=True, compute_hashes=True)
             # 应用规则引擎
             self.rule_engine.apply_all(result.files)
@@ -642,8 +660,38 @@ class StorageCleanerApp:
         if mtype == "progress":
             _, count, size, path = msg
             short = path[-60:] if len(path) > 60 else path
-            self._status_var.set(f"扫描中: {count} 个文件 | {_fmt_size(size)} | {short}")
+            # 扫描阶段：更新确定型进度条
+            if self._scan_phase == "scanning" and self._scan_total_est > 0:
+                self._progress.configure(mode="determinate", maximum=self._scan_total_est)
+                self._progress.stop()
+                self._progress.configure(value=min(count, self._scan_total_est))
+                pct = int(min(count, self._scan_total_est) / max(self._scan_total_est, 1) * 100)
+                self._status_var.set(f"扫描中: {count}/{self._scan_total_est} ({pct}%) | {_fmt_size(size)} | {short}")
+            else:
+                self._status_var.set(f"扫描中: {count} 个文件 | {_fmt_size(size)} | {short}")
             self._file_count_var.set(f"{count} 文件")
+
+            # 哈希阶段提示：切回转圈（无法准确量化）
+            if isinstance(path, str) and path.startswith("哈希检测中:"):
+                if self._scan_phase != "hashing":
+                    self._scan_phase = "hashing"
+                    self._progress.configure(mode="indeterminate")
+                    self._progress.start(10)
+                self._status_var.set(path)
+
+        elif mtype == "scan_total":
+            _, total = msg
+            self._scan_total_est = int(total or 0)
+            self._scan_phase = "scanning"
+            # 切换到确定型进度条
+            if self._scan_total_est > 0:
+                self._progress.stop()
+                self._progress.configure(mode="determinate", maximum=self._scan_total_est, value=0)
+                self._status_var.set(f"开始扫描（预计 {self._scan_total_est} 个文件）...")
+            else:
+                # 无法统计时保持转圈
+                self._progress.configure(mode="indeterminate")
+                self._progress.start(10)
 
         elif mtype == "scan_done":
             _, result, summary = msg
@@ -655,6 +703,7 @@ class StorageCleanerApp:
             self._cancel_btn.configure(state="disabled")
             self._progress.stop()
             self._progress.pack_forget()
+            self._scan_phase = ""
             self._on_scan_complete(result, summary)
 
         elif mtype == "scan_error":
@@ -664,6 +713,7 @@ class StorageCleanerApp:
             self._cancel_btn.configure(state="disabled")
             self._progress.stop()
             self._progress.pack_forget()
+            self._scan_phase = ""
             self._status_var.set(f"扫描出错: {err}")
             messagebox.showerror("扫描错误", err)
 
@@ -1259,7 +1309,8 @@ class SettingsDialog(tk.Toplevel):
         self.explainer = explainer
         self.executor  = executor
         self.title("设置")
-        self.geometry("520x400")
+        # 增大高度，避免 API Key 输入框被遮挡
+        self.geometry("560x640")
         self.configure(bg=C_BG)
         self.resizable(False, False)
         self.grab_set()
@@ -1278,7 +1329,7 @@ class SettingsDialog(tk.Toplevel):
         # Provider
         from config import LLMProvider, DEFAULT_LLM_MODELS, DEFAULT_OPENAI_BASE_URL, DEFAULT_DEEPSEEK_BASE_URL
         self._provider_var = tk.StringVar(value=self.explainer.provider.value)
-        tk.Label(frame1, text="服务商:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8, pady=(6, 0))
+        tk.Label(frame1, text="服务商:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8, pady=(6, 0))
         provider_opts = [p.value for p in LLMProvider]
         provider_box = ttk.Combobox(frame1, values=provider_opts, textvariable=self._provider_var,
                                     state="readonly", height=5)
@@ -1286,17 +1337,15 @@ class SettingsDialog(tk.Toplevel):
 
         # Model
         self._model_var = tk.StringVar(value=self.explainer.model)
-        tk.Label(frame1, text="模型名:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8)
-        model_entry = tk.Entry(frame1, textvariable=self._model_var,
-                               bg=C_BTN, fg=C_TEXT, font=FONT_BODY, relief="flat",
-                               width=50, bd=4)
-        model_entry.pack(padx=8, pady=(2, 6), fill="x")
+        tk.Label(frame1, text="模型名:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8)
+        self._model_box = ttk.Combobox(frame1, textvariable=self._model_var, state="normal", height=6)
+        self._model_box.pack(padx=8, pady=(2, 6), fill="x")
 
         # Base URL（仅 OpenAI/DeepSeek 有意义，Claude/Gemini 可留空）
         self._base_url_var = tk.StringVar(value=getattr(self.explainer, "base_url", "") or "")
-        tk.Label(frame1, text="Base URL（可选）:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8)
+        tk.Label(frame1, text="Base URL（可选）:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8)
         base_entry = tk.Entry(frame1, textvariable=self._base_url_var,
-                              bg=C_BTN, fg=C_TEXT, font=FONT_BODY, relief="flat",
+                              bg=C_BTN, fg=C_TEXT, font=FONT_SETTINGS_ENTRY, relief="flat",
                               width=50, bd=4)
         base_entry.pack(padx=8, pady=(2, 6), fill="x")
         tk.Label(frame1, text="提示：ChatGPT 默认 https://api.openai.com；DeepSeek(OpenAI兼容) 默认 https://api.deepseek.com；DeepSeek(Anthropic兼容) 可填 https://api.deepseek.com/anthropic。",
@@ -1304,9 +1353,9 @@ class SettingsDialog(tk.Toplevel):
 
         # Extra params（JSON，可选，用于 OpenAI/DeepSeek 扩展字段透传）
         self._extra_var = tk.StringVar(value=json.dumps(getattr(self.explainer, "extra_params", {}) or {}, ensure_ascii=False))
-        tk.Label(frame1, text="额外参数（JSON，可选）:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8)
+        tk.Label(frame1, text="额外参数（JSON，可选）:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8)
         extra_entry = tk.Entry(frame1, textvariable=self._extra_var,
-                               bg=C_BTN, fg=C_TEXT, font=FONT_BODY, relief="flat",
+                               bg=C_BTN, fg=C_TEXT, font=FONT_SETTINGS_ENTRY, relief="flat",
                                width=50, bd=4)
         extra_entry.pack(padx=8, pady=(2, 6), fill="x")
         tk.Label(frame1, text="示例：{\"reasoning_effort\":\"high\",\"extra_body\":{\"thinking\":{\"type\":\"enabled\"}}}",
@@ -1314,9 +1363,9 @@ class SettingsDialog(tk.Toplevel):
 
         # API Key
         self._api_var = tk.StringVar(value=self.explainer.api_key)
-        tk.Label(frame1, text="API Key:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL).pack(anchor="w", padx=8)
+        tk.Label(frame1, text="API Key:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8)
         entry = tk.Entry(frame1, textvariable=self._api_var, show="*",
-                         bg=C_BTN, fg=C_TEXT, font=FONT_BODY, relief="flat",
+                         bg=C_BTN, fg=C_TEXT, font=FONT_SETTINGS_ENTRY, relief="flat",
                          width=50, bd=4)
         entry.pack(padx=8, pady=(2, 6), fill="x")
         tk.Label(frame1, text="（也可设置环境变量：OPENAI_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY）",
@@ -1337,7 +1386,16 @@ class SettingsDialog(tk.Toplevel):
                 elif prov == LLMProvider.DEEPSEEK:
                     self._base_url_var.set(DEFAULT_DEEPSEEK_BASE_URL)
 
+            # DeepSeek：模型名限定为 4 个固定选项，提供下拉选择
+            if prov == LLMProvider.DEEPSEEK:
+                self._model_box.configure(values=DEEPSEEK_MODELS, state="readonly")
+                if self._model_var.get().strip() not in DEEPSEEK_MODELS:
+                    self._model_var.set("deepseek-v4-flash")
+            else:
+                self._model_box.configure(values=[], state="normal")
+
         provider_box.bind("<<ComboboxSelected>>", _sync_defaults)
+        _sync_defaults()
 
         # 删除模式
         frame2 = tk.LabelFrame(p, text="删除模式", bg=C_BG,

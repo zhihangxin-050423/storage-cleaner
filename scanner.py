@@ -105,6 +105,28 @@ class Scanner:
         """请求取消正在进行的扫描"""
         self._cancel_flag.set()
 
+    def estimate_total_files(self, root_path: str, skip_system: bool = True) -> int:
+        """
+        预统计文件数量，用于 UI 显示进度条（确定型进度）。
+        说明：该过程只统计数量，不做 os.stat/哈希等重操作。
+        """
+        self._cancel_flag.clear()
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+            if self._cancel_flag.is_set():
+                break
+            if self._should_skip_dir(dirpath, skip_system):
+                dirnames.clear()
+                continue
+            dirnames[:] = [
+                d for d in dirnames
+                if not self._should_skip_dir(os.path.join(dirpath, d), skip_system)
+            ]
+            total += len(filenames)
+            if self.progress_callback and total % 500 == 0:
+                self.progress_callback(total, 0, "预统计中")
+        return total
+
     def scan(self, root_path: str,
              skip_system: bool = True,
              compute_hashes: bool = True) -> ScanResult:

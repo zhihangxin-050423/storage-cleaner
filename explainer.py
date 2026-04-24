@@ -107,10 +107,15 @@ class Explainer:
             raw = self._call_api(prompt, max_tokens=LLM_MAX_TOKENS * len(batch))
 
             if raw:
-                parsed = self._parse_batch_response(raw, batch)
-                for fi, explanation in parsed.items():
+                parsed = self._parse_batch_response(raw, batch)  # {path: explanation}
+                # 将解析结果写入缓存与返回值
+                by_path = {fi.path: fi for fi in batch}
+                for path, explanation in parsed.items():
+                    fi = by_path.get(path)
+                    if fi is None:
+                        continue
                     self._cache[self._cache_key(fi)] = explanation
-                    results[fi.path] = explanation
+                    results[path] = explanation
                 self._save_cache()
 
             if progress_callback:
@@ -363,9 +368,9 @@ class Explainer:
             return _env_first("GEMINI_API_KEY", "GOOGLE_API_KEY")
         return ""
 
-    def _parse_batch_response(self, raw: str, files: List[FileInfo]) -> Dict[FileInfo, str]:
-        """解析批量响应的 JSON"""
-        result: Dict[FileInfo, str] = {}
+    def _parse_batch_response(self, raw: str, files: List[FileInfo]) -> Dict[str, str]:
+        """解析批量响应的 JSON，返回 {file_path: explanation}"""
+        result: Dict[str, str] = {}
         try:
             # 尝试提取 JSON 部分
             start = raw.find('{')
@@ -375,11 +380,11 @@ class Explainer:
                 for i, fi in enumerate(files):
                     key = str(i + 1)
                     if key in data:
-                        result[fi] = str(data[key])
+                        result[fi.path] = str(data[key])
         except (json.JSONDecodeError, Exception):
             # 降级：整体作为第一个文件的解释
             if files:
-                result[files[0]] = raw[:200]
+                result[files[0].path] = raw[:200]
         return result
 
     # ──────────────────────────────────────────────────────────────────────────
