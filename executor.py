@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Callable, Tuple
 from pathlib import Path
 
-from config import RiskLevel, LOG_DIR, OPERATION_LOG_PATH, SYSTEM_CRITICAL_DIRS, HIGH_RISK_EXTENSIONS
+from config import RiskLevel, OPERATION_LOG_DIR, OPERATION_LOG_PATH, SYSTEM_CRITICAL_DIRS, HIGH_RISK_EXTENSIONS
 from scanner import FileInfo, _fmt_size
 
 
@@ -77,11 +77,28 @@ class Executor:
     def __init__(self,
                  use_trash: bool = True,
                  allow_high_risk: bool = False,
-                 progress_callback: Optional[Callable] = None):
+                 progress_callback: Optional[Callable] = None,
+                 operation_log_dir: Optional[str] = None):
         self.use_trash      = use_trash
         self.allow_high_risk = allow_high_risk
         self.progress_callback = progress_callback
         self._has_send2trash = self._check_send2trash()
+        self._operation_log_dir = Path(operation_log_dir) if operation_log_dir else Path(OPERATION_LOG_DIR)
+
+    @property
+    def operation_log_dir(self) -> Path:
+        return self._operation_log_dir
+
+    @operation_log_dir.setter
+    def operation_log_dir(self, value):
+        if value is None:
+            self._operation_log_dir = Path(OPERATION_LOG_DIR)
+        else:
+            self._operation_log_dir = Path(str(value))
+
+    @property
+    def operation_log_path(self) -> Path:
+        return self.operation_log_dir / "operation_log.json"
 
     # ──────────────────────────────────────────────────────────────────────────
     # 公共 API
@@ -116,16 +133,18 @@ class Executor:
     def get_operation_log(self) -> List[dict]:
         """读取历史操作日志"""
         try:
-            if OPERATION_LOG_PATH.exists():
-                return json.loads(OPERATION_LOG_PATH.read_text(encoding='utf-8'))
+            p = self.operation_log_path
+            if p.exists():
+                return json.loads(p.read_text(encoding='utf-8'))
         except Exception:
             pass
         return []
 
     def clear_log(self):
         try:
-            if OPERATION_LOG_PATH.exists():
-                OPERATION_LOG_PATH.unlink()
+            p = self.operation_log_path
+            if p.exists():
+                p.unlink()
         except Exception:
             pass
 
@@ -312,13 +331,13 @@ class Executor:
     def _append_log(self, records: List[OperationRecord]):
         """将新记录追加到 JSON 日志文件"""
         try:
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self.operation_log_dir.mkdir(parents=True, exist_ok=True)
             existing = self.get_operation_log()
             existing.extend([r.to_dict() for r in records])
             # 日志最多保留 10000 条
             if len(existing) > 10000:
                 existing = existing[-10000:]
-            OPERATION_LOG_PATH.write_text(
+            self.operation_log_path.write_text(
                 json.dumps(existing, ensure_ascii=False, indent=2),
                 encoding='utf-8'
             )

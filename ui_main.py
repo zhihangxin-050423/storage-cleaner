@@ -22,7 +22,7 @@ from datetime import datetime
 
 from config import (
     RiskLevel, RISK_BG, RISK_FG, RISK_TAG,
-    DOWNLOADS_DIR, LOG_DIR, OPERATION_LOG_PATH,
+    DOWNLOADS_DIR,
 )
 from scanner import Scanner, FileInfo, ScanResult, _fmt_size
 from rule_engine import RuleEngine
@@ -55,11 +55,12 @@ C_HIGH_BG   = "#3A1020"
 C_BTN       = "#313244"
 C_BTN_HOV   = "#45475A"
 
-FONT_H1    = ("Segoe UI", 14, "bold")
-FONT_H2    = ("Segoe UI", 11, "bold")
-FONT_BODY  = ("Segoe UI", 10)
-FONT_SMALL = ("Segoe UI", 9)
-FONT_MONO  = ("Consolas", 9)
+# 统一把基础字号上调一档（高 DPI 下更清晰）
+FONT_H1    = ("Segoe UI", 16, "bold")
+FONT_H2    = ("Segoe UI", 12, "bold")
+FONT_BODY  = ("Segoe UI", 11)
+FONT_SMALL = ("Segoe UI", 10)
+FONT_MONO  = ("Consolas", 10)
 
 # 设置窗口字体（更大一些，避免在高 DPI 下过小）
 FONT_SETTINGS_LABEL = ("Segoe UI", 12)
@@ -188,7 +189,7 @@ class StorageCleanerApp:
         bar.pack_propagate(False)
 
         # Logo / 标题
-        tk.Label(bar, text="💾 StorageCleaner", font=("Segoe UI", 13, "bold"),
+        tk.Label(bar, text="💾 StorageCleaner", font=("Segoe UI", 14, "bold"),
                  bg=C_PANEL, fg=C_ACCENT).pack(side="left", padx=16)
 
         # 扫描路径
@@ -588,7 +589,7 @@ class StorageCleanerApp:
         style.theme_use("clam")
 
         tv_cfg = dict(background=C_PANEL, foreground=C_TEXT,
-                      fieldbackground=C_PANEL, rowheight=24)
+                      fieldbackground=C_PANEL, rowheight=28)
         style.configure("Treeview", **tv_cfg, font=FONT_SMALL)
         style.configure("Treeview.Heading",
                         background=C_BTN, foreground=C_TEXT,
@@ -602,6 +603,9 @@ class StorageCleanerApp:
         style.configure("TScrollbar", background=C_PANEL,
                          troughcolor=C_BG, arrowcolor=C_SUBTEXT)
         style.configure("TProgressbar", background=C_ACCENT)
+        # 设置窗口里的 ttk 控件（Combobox/Entry/Button）需要通过 ttk.Style 设字体，否则会显得很小
+        style.configure("TCombobox", font=FONT_BODY)
+        style.configure("TButton", font=FONT_BODY)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 扫描控制
@@ -1410,19 +1414,24 @@ class SettingsDialog(tk.Toplevel):
                                 fg=C_TEXT, font=FONT_BODY)
         frame1.pack(fill="x", padx=8, pady=8)
 
+        # ttk：为设置窗口单独定义更大的样式（避免全局覆盖引发意外）
+        sstyle = ttk.Style(self)
+        sstyle.configure("Settings.TCombobox", font=FONT_SETTINGS_ENTRY)
+        sstyle.configure("Settings.TButton", font=FONT_SETTINGS_ENTRY)
+
         # Provider
         from config import LLMProvider, DEFAULT_LLM_MODELS, DEFAULT_OPENAI_BASE_URL, DEFAULT_DEEPSEEK_BASE_URL
         self._provider_var = tk.StringVar(value=self.explainer.provider.value)
         tk.Label(frame1, text="服务商:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8, pady=(6, 0))
         provider_opts = [p.value for p in LLMProvider]
         provider_box = ttk.Combobox(frame1, values=provider_opts, textvariable=self._provider_var,
-                                    state="readonly", height=5)
+                                    state="readonly", height=5, style="Settings.TCombobox")
         provider_box.pack(padx=8, pady=(2, 6), fill="x")
 
         # Model
         self._model_var = tk.StringVar(value=self.explainer.model)
         tk.Label(frame1, text="模型名:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8)
-        self._model_box = ttk.Combobox(frame1, textvariable=self._model_var, state="normal", height=6)
+        self._model_box = ttk.Combobox(frame1, textvariable=self._model_var, state="normal", height=6, style="Settings.TCombobox")
         self._model_box.pack(padx=8, pady=(2, 6), fill="x")
 
         # Base URL（仅 OpenAI/DeepSeek 有意义，Claude/Gemini 可留空）
@@ -1505,11 +1514,30 @@ class SettingsDialog(tk.Toplevel):
         frame3 = tk.LabelFrame(content, text="操作日志", bg=C_BG,
                                 fg=C_TEXT, font=FONT_BODY)
         frame3.pack(fill="x", padx=8, pady=8)
-        tk.Label(
+
+        # 日志目录（可自定义；默认项目目录下 logs/operation）
+        self._log_dir_var = tk.StringVar(value=str(getattr(self.executor, "operation_log_dir", "")))
+        tk.Label(frame3, text="日志存放目录:", bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_LABEL).pack(anchor="w", padx=8, pady=(6, 0))
+        log_row = tk.Frame(frame3, bg=C_BG)
+        log_row.pack(fill="x", padx=8, pady=(2, 6))
+        log_entry = tk.Entry(log_row, textvariable=self._log_dir_var,
+                             bg=C_BTN, fg=C_TEXT, font=FONT_SETTINGS_ENTRY, relief="flat",
+                             bd=4)
+        log_entry.pack(side="left", fill="x", expand=True)
+
+        def _pick_log_dir():
+            d = filedialog.askdirectory(title="选择操作日志存放目录", initialdir=self._log_dir_var.get() or os.getcwd())
+            if d:
+                self._log_dir_var.set(d)
+
+        ttk.Button(log_row, text="浏览...", command=_pick_log_dir, style="Settings.TButton").pack(side="left", padx=(8, 0))
+
+        self._log_hint = tk.Label(
             frame3,
-            text=f"日志保存路径：{OPERATION_LOG_PATH}",
+            text="提示：会在该目录下创建 `operation_log.json`，集中存放所有操作记录。",
             bg=C_BG, fg=C_SUBTEXT, font=FONT_SETTINGS_HINT, wraplength=660, justify="left"
-        ).pack(anchor="w", padx=8, pady=6)
+        )
+        self._log_hint.pack(anchor="w", padx=8, pady=(0, 6))
 
         # 按钮
         btns = tk.Frame(content, bg=C_BG)
@@ -1539,4 +1567,8 @@ class SettingsDialog(tk.Toplevel):
 
         self.explainer.configure(provider=provider, api_key=key, model=model, base_url=base_url, extra_params=extra)
         self.executor.use_trash = self._trash_var.get()
+        # 日志目录
+        log_dir = (self._log_dir_var.get() or "").strip()
+        if log_dir:
+            self.executor.operation_log_dir = log_dir
         self.destroy()

@@ -242,6 +242,8 @@ LLM_MODEL              = "claude-sonnet-4-20250514"  # 使用的AI模型
 
 ## 开发者说明
 
-- 该项目正在维护中，如您有对本项目的建议均可以与开发者联系
+- 该项目正在维护中，如您有对本项目的建议或任何问题均可以与开发者联系
 - 开发者邮箱：
- [1131230221@stu.jiangnan.edu.cn](mailto:1131230221@stu.jiangnan.edu.cn)  [zhihangxin691@gmail.com](mailto:zhihangxin691@gmail.com) （中国·无锡·江南大学·数学与数据科学学院）
+ [1131230221@stu.jiangnan.edu.cn](mailto:1131230221@stu.jiangnan.edu.cn)  
+ [zhihangxin691@gmail.com](mailto:zhihangxin691@gmail.com) 
+（中国·无锡·江南大学·数学与数据科学学院）

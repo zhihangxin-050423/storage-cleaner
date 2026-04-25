@@ -254,5 +254,11 @@ LLM_MAX_TOKENS = 600
 # 日志路径
 # ──────────────────────────────────────────────────────────────────────────────
 
-LOG_DIR            = pathlib.Path.home() / "AppData" / "Local" / "StorageCleaner"
-OPERATION_LOG_PATH = LOG_DIR / "operation_log.json"
+# 默认把日志放在“项目目录”下，避免散落在用户目录里难以区分/迁移
+# 项目结构：<project_root>/storage_cleaner/config.py
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+# 允许用户在设置中自定义日志目录；这里提供默认值（目录而不是单文件）
+LOG_BASE_DIR        = PROJECT_ROOT / "logs"
+OPERATION_LOG_DIR   = LOG_BASE_DIR / "operation"
+OPERATION_LOG_PATH  = OPERATION_LOG_DIR / "operation_log.json"
