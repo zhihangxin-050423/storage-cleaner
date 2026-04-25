@@ -1,2 +1,4 @@
+# Third-party runtime dependencies used by storage_cleaner.
+# The rest of the imports are Python standard library modules or local files.
 send2trash>=1.8.2
 anthropic>=0.28.0

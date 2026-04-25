@@ -17,6 +17,8 @@ import os
 import re
 import json
 import math
+import time
+import random
 import hashlib
 import threading
 import uuid
@@ -231,6 +233,8 @@ class Explainer:
         self.extra_params: Dict = extra_params or {}
         self.last_error: str = ""
         self.last_request_id: str = ""
+        self.last_error_kind: str = ""  # auth | model_not_found | rate_limit | overloaded | context_overflow | timeout | network | other
+        self.last_call_meta: Dict[str, object] = {}  # request_id/latency/usage/finish_reason/provider/model
 
         self._cache = ExplainerCache(_CACHE_PATH)
         # system prompt 缓存：静态段落 + 动态段落（跨请求稳定，减少细微波动）
@@ -268,6 +272,11 @@ class Explainer:
             return f"（AI 解释生成失败：{self.last_error or '未知错误'}）{extra}"
 
         data = self._extract_json(raw)
+        # max_tokens 截断/输出混入前后缀时，尝试一次“只补全 JSON”的恢复请求
+        if not data:
+            recovered = self._recover_single_json(raw)
+            if recovered:
+                data = self._extract_json(recovered)
         if data and isinstance(data, dict):
             explanation, suggestion, confidence = self._format_single_structured(fi, data)
         else:
@@ -293,6 +302,22 @@ class Explainer:
         fi.ai_suggestion = suggestion
         fi.ai_confidence = confidence
         return explanation
+
+    def _recover_single_json(self, raw_text: str) -> Optional[str]:
+        t = (raw_text or "").strip()
+        if not t or "{" not in t:
+            return None
+        looks_truncated = t.count("{") > t.count("}") or not t.endswith("}")
+        if not looks_truncated:
+            # 也可能是带了前后缀（非 JSON），但包含 JSON 片段；extract_json 已经尽力了
+            return None
+        sys = "你是 JSON 修复器。只输出合法 JSON 对象，不要任何额外文本。"
+        user = (
+            "下面是模型输出，但可能被截断/包含多余文本导致无法解析。\n"
+            "请你只输出一个完整 JSON 对象，严格满足字段：origin/function/delete_impact/suggestion/confidence。\n\n"
+            f"原始输出：\n{t[:2000]}"
+        )
+        return self._call_api_with_retry(system=sys, user=user, max_tokens=400, retries=1)
 
     def explain_batch(self, files: List[FileInfo],
                       progress_callback=None) -> Dict[str, str]:
@@ -324,38 +349,73 @@ class Explainer:
         completed = 0
         lock = threading.Lock()
 
-        def process_batch(batch: List[FileInfo]) -> Dict[str, str]:
+        def _finish_progress(n: int):
             nonlocal completed
-            # 未知文件批次给更高 token 预算；已知缓存批次更省 token
+            with lock:
+                completed += n
+                if progress_callback:
+                    progress_callback(completed, len(to_fetch))
+
+        def _calc_dynamic_max_tokens(batch: List[FileInfo]) -> int:
             _, _, unknown = self._classify_files(batch)
             unknown_ratio = (len(unknown) / max(1, len(batch)))
-            # 约束：每文件最多 150 tokens；未知文件占比越高，上限越靠近 max_tokens_per_batch
             per_file_cap = 150
             dynamic_cap = int(min(max_tokens_per_batch, max(300, (80 + 70 * unknown_ratio) * len(batch))))
+            return min(dynamic_cap, per_file_cap * len(batch))
+
+        def _try_recover_batch_json(raw_text: str, batch: List[FileInfo]) -> Optional[str]:
+            # 如果看起来像 JSON 被截断/混入前后缀，尝试一次“只补全 JSON”的恢复请求
+            t = (raw_text or "").strip()
+            if not t or "{" not in t:
+                return None
+            looks_truncated = t.count("{") > t.count("}") or not t.endswith("}")
+            if not looks_truncated:
+                return None
+            sys = "你是 JSON 修复器。只输出合法 JSON 对象，不要任何额外文本。"
+            user = (
+                f"下面是批量分析的输出，但可能被截断/包含前后缀，导致无法解析。\n"
+                f"请你只输出一个完整 JSON 对象，键为文件序号字符串（\"1\",\"2\",...），值为对象。\n\n"
+                f"原始输出：\n{t[:2000]}"
+            )
+            return self._call_api_with_retry(system=sys, user=user, max_tokens=600, retries=1)
+
+        def _process_batch_with_split(batch: List[FileInfo], depth: int = 0) -> Dict[str, str]:
+            # 上下文超限：自动二分拆批重试（参考 Claude Code 的恢复思路）
             raw = self._call_api_with_retry(
                 system=self._get_system_prompt(mode="batch"),
                 user=self._build_batch_user(batch),
-                max_tokens=min(dynamic_cap, per_file_cap * len(batch)),
+                max_tokens=_calc_dynamic_max_tokens(batch),
                 retries=2,
             )
-            batch_results: Dict[str, str] = {}
+
             if not raw:
+                # 仅在“上下文超限”时自动拆批；其他错误直接返回错误占位
+                if self.last_error_kind == "context_overflow" and len(batch) > 1 and depth < 4:
+                    mid = max(1, len(batch) // 2)
+                    left = _process_batch_with_split(batch[:mid], depth + 1)
+                    right = _process_batch_with_split(batch[mid:], depth + 1)
+                    return {**left, **right}
+
                 rid = (self.last_request_id or "").strip()
                 extra = f" request_id: {rid}" if rid else ""
                 msg = f"（批量 AI 分析失败：{self.last_error or '未知错误'}）{extra}"
-                for fi in batch:
-                    batch_results[fi.path] = msg
-                with lock:
-                    completed += len(batch)
-                    if progress_callback:
-                        progress_callback(completed, len(to_fetch))
-                return batch_results
+                out = {fi.path: msg for fi in batch}
+                _finish_progress(len(batch))
+                return out
 
+            # 正常解析；若解析完全失败且疑似截断，尝试恢复一次
             parsed = self._parse_batch_response_robust(raw, batch)
+            if parsed and all(str(v).startswith("（") and "解析失败" in str(v) for v in parsed.values()):
+                recovered = _try_recover_batch_json(raw, batch)
+                if recovered:
+                    parsed2 = self._parse_batch_response_robust(recovered, batch)
+                    if parsed2:
+                        parsed = parsed2
+
+            batch_results: Dict[str, str] = {}
             for path, expl in parsed.items():
                 fi = next((f for f in batch if f.path == path), None)
                 if fi:
-                    # 批量输出通常更简略：置信度给一个中间值，建议从文本里提取
                     suggestion = self._extract_suggestion_from_text(expl)
                     entry = CacheEntry(
                         explanation=expl,
@@ -370,19 +430,39 @@ class Explainer:
                     fi.ai_confidence = entry.confidence
                     batch_results[path] = expl
 
-            with lock:
-                completed += len(batch)
-                if progress_callback:
-                    progress_callback(completed, len(to_fetch))
+            _finish_progress(len(batch))
             return batch_results
 
+        # 兼容原 executor：返回 (results, error_kind) 以支持动态并发调节
+        def process_batch(batch: List[FileInfo]) -> Tuple[Dict[str, str], str]:
+            before = self.last_error_kind
+            r = _process_batch_with_split(batch, depth=0)
+            # 如果这次 batch 触发了限流/过载，带回 kind 让调度层调整并发
+            kind = self.last_error_kind if self.last_error_kind in ("rate_limit", "overloaded") else ""
+            if not kind and before in ("rate_limit", "overloaded"):
+                kind = before
+            return r, kind
+
+        # 动态并发降级：当出现 429/529 时，降低并发并增加等待（避免持续打到限流）
+        adaptive_workers = max_workers
+        i = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(process_batch, b) for b in batches]
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    results.update(f.result(timeout=90))
-                except Exception:
-                    pass
+            inflight: List[concurrent.futures.Future] = []
+            while i < len(batches) or inflight:
+                while i < len(batches) and len(inflight) < adaptive_workers:
+                    inflight.append(ex.submit(process_batch, batches[i]))
+                    i += 1
+
+                done, inflight = concurrent.futures.wait(inflight, return_when=concurrent.futures.FIRST_COMPLETED, timeout=90)
+                for f in done:
+                    try:
+                        r, kind = f.result(timeout=1)
+                        results.update(r)
+                        if kind in ("rate_limit", "overloaded"):
+                            adaptive_workers = max(1, adaptive_workers - 1)
+                            time.sleep(0.6 + random.random() * 0.6)
+                    except Exception:
+                        pass
 
         self._cache.save()
 
@@ -557,6 +637,7 @@ class Explainer:
         - OverloadedError (529) 有独立计数器，上层 error 可用于 UI 提示
         """
         self.last_error = ""
+        self.last_error_kind = ""
         client = RetryClient(max_retries=retries)
         try:
             result = client.call(
@@ -565,20 +646,28 @@ class Explainer:
             return result
         except AuthError as e:
             self.last_error = str(e) or ERROR_MESSAGES["auth_failed"]
+            self.last_error_kind = "auth"
         except ModelNotFoundError as e:
             self.last_error = str(e) or ERROR_MESSAGES["model_not_found"]
+            self.last_error_kind = "model_not_found"
         except RateLimitError as e:
             self.last_error = str(e) or ERROR_MESSAGES["rate_limit"]
+            self.last_error_kind = "rate_limit"
         except OverloadedError as e:
             self.last_error = str(e) or ERROR_MESSAGES["overloaded"]
+            self.last_error_kind = "overloaded"
         except ContextOverflowError as e:
             self.last_error = str(e) or ERROR_MESSAGES["context_overflow"]
+            self.last_error_kind = "context_overflow"
         except TimeoutErrorLLM as e:
             self.last_error = str(e) or ERROR_MESSAGES["timeout"]
+            self.last_error_kind = "timeout"
         except NetworkError as e:
             self.last_error = str(e) or ERROR_MESSAGES["network_error"]
+            self.last_error_kind = "network"
         except Exception as e:
             self.last_error = str(e)[:200] if str(e) else "未知错误"
+            self.last_error_kind = "other"
         return None
 
     def _call_with_messages(self, system: str, user: str, max_tokens: int) -> Optional[str]:
@@ -908,8 +997,11 @@ class Explainer:
         失败时抛出 APIError 子类，由上层 RetryClient 处理重试。
         """
         timeout_s = _resolve_api_timeout_s(timeout_s)
+        started = time.monotonic()
         data, req_id = http_post_json(url, headers, payload, timeout_s=timeout_s, model=self.model)
         self.last_request_id = req_id
+        latency_ms = int((time.monotonic() - started) * 1000)
+        self._update_call_meta_from_response(url=url, data=data, latency_ms=latency_ms)
         return data
 
     def _http_post_openai_stream_text(self, url: str, headers: Dict[str, str], payload: dict) -> Optional[str]:
@@ -919,13 +1011,51 @@ class Explainer:
         失败时抛出 APIError 子类；返回 None 时上层降级到非流式。
         """
         idle_timeout_s = _resolve_stream_idle_timeout_s()
+        started = time.monotonic()
         text, req_id = http_post_openai_stream_text(
             url, headers, payload,
             idle_timeout_s=idle_timeout_s,
             model=self.model,
         )
         self.last_request_id = req_id
+        latency_ms = int((time.monotonic() - started) * 1000)
+        self._update_call_meta_from_response(url=url, data={}, latency_ms=latency_ms)
         return text
+
+    def _update_call_meta_from_response(self, url: str, data: dict, latency_ms: int):
+        """轻量统一元信息：provider/model/request_id/latency/usage/finish_reason。"""
+        meta: Dict[str, object] = {
+            "provider": self.provider.value,
+            "model": self.model,
+            "request_id": (self.last_request_id or "").strip(),
+            "latency_ms": latency_ms,
+            "url": url,
+        }
+        try:
+            if self.provider in (LLMProvider.OPENAI, LLMProvider.DEEPSEEK):
+                usage = data.get("usage") if isinstance(data, dict) else None
+                if isinstance(usage, dict):
+                    meta["usage"] = usage
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    meta["finish_reason"] = choices[0].get("finish_reason")
+            elif self.provider == LLMProvider.ANTHROPIC:
+                usage = data.get("usage") if isinstance(data, dict) else None
+                if isinstance(usage, dict):
+                    meta["usage"] = usage
+                if isinstance(data, dict):
+                    meta["finish_reason"] = data.get("stop_reason")
+            elif self.provider == LLMProvider.GEMINI:
+                if isinstance(data, dict):
+                    usage = data.get("usageMetadata") or data.get("usage_metadata")
+                    if isinstance(usage, dict):
+                        meta["usage"] = usage
+                    cands = data.get("candidates") or []
+                    if isinstance(cands, list) and cands and isinstance(cands[0], dict):
+                        meta["finish_reason"] = cands[0].get("finishReason") or cands[0].get("finish_reason")
+        except Exception:
+            pass
+        self.last_call_meta = meta
 
     @staticmethod
     def _default_api_key_for_provider(provider: LLMProvider) -> str:
