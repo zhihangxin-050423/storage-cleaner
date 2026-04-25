@@ -40,6 +40,7 @@ class FileInfo:
     category:      str          = ""
     risk_level:    str          = ""   # "低风险" / "中风险" / "高风险"
     risk_reason:   str          = ""   # 规则引擎给出的原因
+    rule_hits:     List[str]    = field(default_factory=list)  # 多条命中证据（用于 UI/AI 展示）
     ai_explanation:str          = ""   # LLM 生成的解释
     ai_suggestion: str          = ""   # "safe_to_delete" | "keep" | "caution" | ""
     ai_confidence: float        = 0.0  # 0.0 ~ 1.0
@@ -107,12 +108,15 @@ class Scanner:
         """请求取消正在进行的扫描"""
         self._cancel_flag.set()
 
+    def reset_cancel(self):
+        """开始一次新的扫描任务前清空取消标记（由 UI/任务控制层统一管理）。"""
+        self._cancel_flag.clear()
+
     def estimate_total_files(self, root_path: str, skip_system: bool = True) -> int:
         """
         预统计文件数量，用于 UI 显示进度条（确定型进度）。
         说明：该过程只统计数量，不做 os.stat/哈希等重操作。
         """
-        self._cancel_flag.clear()
         total = 0
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
             if self._cancel_flag.is_set():
@@ -140,7 +144,6 @@ class Scanner:
         :param compute_hashes: 是否计算哈希（用于查重）
         :return: ScanResult
         """
-        self._cancel_flag.clear()
         result = ScanResult()
         t0 = time.time()
 
@@ -298,17 +301,77 @@ class Scanner:
 
                 for full_h, dups in confirmed_map.items():
                     if len(dups) > 1:
-                        result.duplicate_groups[full_h] = dups
-                        for dup in dups[1:]:
+                        # 选择“保留哪个”：用启发式打分替代扫描顺序
+                        keep = self._choose_duplicate_keep(dups)
+                        ordered = [keep] + [x for x in dups if x.path != keep.path]
+                        result.duplicate_groups[full_h] = ordered
+                        for dup in ordered[1:]:
                             dup.is_duplicate = True
-                            dup.duplicate_of = dups[0].path
+                            dup.duplicate_of = ordered[0].path
             else:
                 for h, dups in hash_map.items():
                     if len(dups) > 1:
-                        result.duplicate_groups[h] = dups
-                        for dup in dups[1:]:
+                        keep = self._choose_duplicate_keep(dups)
+                        ordered = [keep] + [x for x in dups if x.path != keep.path]
+                        result.duplicate_groups[h] = ordered
+                        for dup in ordered[1:]:
                             dup.is_duplicate = True
-                            dup.duplicate_of = dups[0].path
+                            dup.duplicate_of = ordered[0].path
+
+    def _choose_duplicate_keep(self, files: List[FileInfo]) -> FileInfo:
+        """
+        重复文件保留策略（启发式打分）：
+        - 优先保留非临时/缓存/下载目录中的文件
+        - 文件名包含 copy/副本/(1)/重复 等更像副本 → 降分
+        - mtime 更新、路径更短 → 略加分
+        """
+        if not files:
+            raise ValueError("empty files")
+
+        home = os.path.normcase(os.path.abspath(os.path.expanduser("~")))
+        downloads = os.path.normcase(os.path.abspath(os.path.join(home, "Downloads")))
+        desktop = os.path.normcase(os.path.abspath(os.path.join(home, "Desktop")))
+        documents = os.path.normcase(os.path.abspath(os.path.join(home, "Documents")))
+        pictures = os.path.normcase(os.path.abspath(os.path.join(home, "Pictures")))
+        videos = os.path.normcase(os.path.abspath(os.path.join(home, "Videos")))
+
+        def in_dir(p: str, base: str) -> bool:
+            try:
+                ap = os.path.normcase(os.path.abspath(p))
+                return ap == base or ap.startswith(base + os.sep)
+            except Exception:
+                return False
+
+        def score(fi: FileInfo) -> float:
+            s = 0.0
+            p = os.path.normcase(fi.path)
+            name_l = (fi.name or "").lower()
+
+            # 目录语义
+            if in_dir(p, downloads):
+                s -= 2.0
+            if "appdata" in p and ("\\temp\\" in p or "\\cache" in p or "\\caches" in p):
+                s -= 3.0
+            if "\\temp\\" in p:
+                s -= 3.0
+            if any(in_dir(p, x) for x in (desktop, documents, pictures, videos)):
+                s += 3.0
+
+            # 名称副本特征
+            if any(k in name_l for k in (" copy", "副本", "复制", "(1)", "(2)", "重复", " - copy")):
+                s -= 1.5
+
+            # 修改时间越新越可信（轻权重）
+            try:
+                s += min(1.0, max(0.0, (time.time() - fi.mtime) / -86400 / 365))  # 越新越高，最多 +1
+            except Exception:
+                pass
+
+            # 路径越短越加分（轻权重）
+            s += max(0.0, 1.0 - (len(fi.path) / 260.0))
+            return s
+
+        return max(files, key=score)
 
     def _compute_hash(self, filepath: str, size: int, mode: str = "auto") -> Optional[str]:
         """

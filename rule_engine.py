@@ -26,8 +26,18 @@ from config import (
     OLD_FILE_DAYS, VERY_OLD_FILE_DAYS,
     DOWNLOADS_DIR,
     LOG_DIR,
+    SYNC_DRIVE_DIR_NAMES,
 )
 from scanner import FileInfo
+from path_matcher import (
+    has_any_segment,
+    contains_sequence,
+    is_chromium_profile_cache,
+    is_firefox_profile_cache,
+    has_segment,
+    contains_all_segments,
+    any_segment_startswith,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -109,6 +119,32 @@ class KnownCacheDirRule(BaseRule):
 
     def apply(self, fi: FileInfo) -> RuleResult:
         nc = os.path.normcase(fi.path)
+        # 结构化匹配：优先识别常见“目录段序列”，减少 frag in path 误判
+        if contains_sequence(nc, ("node_modules", ".cache")) or contains_sequence(nc, ("__pycache__",)):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.LOW,
+                category=FileCategory.CACHE,
+                reason="位于常见开发缓存目录，可安全清理",
+                priority=self.priority,
+            )
+        # 浏览器缓存：支持多 Profile
+        if is_chromium_profile_cache(nc):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.LOW,
+                category=FileCategory.CACHE,
+                reason="位于 Chromium 浏览器 Profile 缓存目录，可安全清理",
+                priority=self.priority,
+            )
+        if is_firefox_profile_cache(nc):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.LOW,
+                category=FileCategory.CACHE,
+                reason="位于 Firefox Profiles 缓存目录（cache2），可安全清理",
+                priority=self.priority,
+            )
         for frag in KNOWN_CACHE_FRAGMENTS:
             # 支持通配符片段（如包含 * ?），否则使用简单子串匹配
             try:
@@ -185,6 +221,162 @@ class MediumRiskCacheRule(BaseRule):
                 )
         return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
 
+class DevToolCacheRule(BaseRule):
+    """
+    开发工具缓存/构建加速缓存（建议默认中风险）：
+    这些目录经常位于项目目录，删除可能导致下次构建/检查变慢或丢失本地索引。
+    """
+    name = "DevToolCache"
+    priority = 88
+
+    def apply(self, fi: FileInfo) -> RuleResult:
+        nc = os.path.normcase(fi.path)
+        # cmake-build-*（常见 IDE 生成目录）
+        if any_segment_startswith(nc, "cmake-build-"):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于 CMake 构建目录（cmake-build-*），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        # 目录段匹配（Path.parts 级别）
+        segments = {
+            ".parcel-cache", ".turbo", ".vite", ".eslintcache", ".ruff_cache",
+            ".pytest_cache", ".mypy_cache", ".tox",
+            "htmlcov", "coverage",
+            "cmakefiles",
+            # Rust/Go/Python 工具链常见缓存/产物
+            "target", "go-build",
+            "uv", "pypoetry",
+        }
+        if has_any_segment(nc, segments):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于开发工具缓存目录（加速构建/检查），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        # 更精确：.cache\uv 或 .cache\pypoetry
+        if contains_sequence(nc, (".cache", "uv")) or contains_sequence(nc, (".cache", "pypoetry")):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于 Python 工具缓存（uv/poetry），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        # pipenv / pip-tools 缓存：.cache\pipenv
+        if contains_sequence(nc, (".cache", "pipenv")):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于 pipenv 缓存（.cache\\pipenv），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        # poetry 更完整：AppData\Local\pypoetry\cache
+        if contains_sequence(nc, ("appdata", "local", "pypoetry", "cache")):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于 Poetry 缓存（AppData\\Local\\pypoetry\\cache），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        # uv 更完整：AppData\Local\uv\cache
+        if contains_sequence(nc, ("appdata", "local", "uv", "cache")):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于 uv 缓存（AppData\\Local\\uv\\cache），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        # Go module cache: ...\go\pkg\mod
+        if contains_sequence(nc, ("go", "pkg", "mod")):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于 Go module 缓存（pkg\\mod），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        # 覆盖“文件级缓存”特征（即使不在目录段中）
+        name_l = (fi.name or "").lower()
+        if name_l in (".coverage",) or name_l.endswith(".eslintcache"):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="开发工具缓存文件（coverage/eslintcache），通常可重建但建议确认后清理",
+                priority=self.priority,
+            )
+        return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
+
+
+class SyncDriveRule(BaseRule):
+    """同步盘目录中的文件 -> 高风险（更保守）"""
+    name = "SyncDrive"
+    priority = 95
+
+    def apply(self, fi: FileInfo) -> RuleResult:
+        nc = os.path.normcase(fi.path)
+        if has_any_segment(nc, SYNC_DRIVE_DIR_NAMES):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.HIGH,
+                category=FileCategory.CONFIG,
+                reason="位于同步盘目录（删除可能同步到云端），默认不建议删除",
+                priority=self.priority,
+            )
+        return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
+
+class WindowsUserDataProtectionRule(BaseRule):
+    """用户 AppData 下的 Windows 核心子目录：更保守（避免误删系统/索引/体验数据）。"""
+    name = "WindowsUserDataProtection"
+    priority = 94
+
+    def apply(self, fi: FileInfo) -> RuleResult:
+        nc = os.path.normcase(fi.path)
+        if contains_all_segments(nc, ("appdata", "local", "microsoft", "windows")):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.HIGH,
+                category=FileCategory.SYSTEM,
+                reason="位于 AppData\\Local\\Microsoft\\Windows（系统/索引/体验数据），默认不建议删除",
+                priority=self.priority,
+            )
+        if contains_all_segments(nc, ("appdata", "roaming", "microsoft", "windows")):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.HIGH,
+                category=FileCategory.SYSTEM,
+                reason="位于 AppData\\Roaming\\Microsoft\\Windows（系统配置/外壳数据），默认不建议删除",
+                priority=self.priority,
+            )
+        return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
+
+
+class SensitiveConfigRule(BaseRule):
+    """敏感配置/密钥路径启发式（如 .ssh/config） -> 高风险"""
+    name = "SensitiveConfig"
+    priority = 92
+
+    def apply(self, fi: FileInfo) -> RuleResult:
+        name_l = (fi.name or "").lower()
+        nc = os.path.normcase(fi.path).lower()
+        if contains_sequence(nc, (".ssh",)) and name_l in ("config", "known_hosts", "authorized_keys", "id_rsa", "id_ed25519"):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.HIGH,
+                category=FileCategory.CONFIG,
+                reason="位于 .ssh 目录的敏感配置/密钥文件，禁止自动删除",
+                priority=self.priority,
+            )
+        return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
+
 
 class BuildArtifactRule(BaseRule):
     """常见构建产物目录 -> 中风险"""
@@ -194,15 +386,20 @@ class BuildArtifactRule(BaseRule):
     def apply(self, fi: FileInfo) -> RuleResult:
         # 构建产物通常可重建，但可能影响当前项目构建/调试，因此默认中风险
         nc = os.path.normcase(fi.path)
-        for frag in BUILD_ARTIFACT_FRAGMENTS:
-            if frag in nc:
-                return RuleResult(
-                    matched=True,
-                    risk_level=RiskLevel.MEDIUM,
-                    category=FileCategory.CACHE,
-                    reason="位于常见构建/产物目录（通常可重建），建议确认后清理",
-                    priority=self.priority,
-                )
+        # 结构化匹配：目录段命中（避免 "\dist\\" 这种字符串脆弱写法）
+        build_dirs = {
+            "dist", "build", "out", "target", "coverage", "obj", "bin",
+            ".next", ".nuxt", ".angular", ".svelte-kit", ".terraform",
+            "cmake-build-debug", "cmake-build-release", "cmakefiles",
+        }
+        if has_any_segment(nc, build_dirs):
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.CACHE,
+                reason="位于常见构建/产物目录（通常可重建），建议确认后清理",
+                priority=self.priority,
+            )
         return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
 
 
@@ -288,16 +485,58 @@ class LogFileRule(BaseRule):
     def apply(self, fi: FileInfo) -> RuleResult:
         if fi.extension in LOG_EXTENSIONS:
             days = fi.mtime_days_ago
-            risk = RiskLevel.LOW if days > 30 else RiskLevel.MEDIUM
+            # 安装/系统语义目录下的日志更保守（即便较旧，也不直接给“低风险”）
+            nc = os.path.normcase(fi.path)
+            installish = has_any_segment(nc, {"program files", "program files (x86)", "windows", "programdata"})
+            if installish:
+                risk = RiskLevel.MEDIUM
+            else:
+                # 近 24 小时仍在写入：更保守
+                if days <= 1:
+                    risk = RiskLevel.MEDIUM
+                else:
+                    risk = RiskLevel.LOW if days > 30 else RiskLevel.MEDIUM
+            big_hint = ""
+            try:
+                if fi.size >= 200 * 1024 * 1024 and days > 30 and not installish:
+                    big_hint = "；体积很大且长期未修改，清理收益高"
+            except Exception:
+                pass
             return RuleResult(
                 matched=True,
                 risk_level=risk,
                 category=FileCategory.LOG,
                 reason=(f"日志文件，最后修改 {days} 天前，"
-                        + ("可清理" if risk == RiskLevel.LOW else "可能仍在使用，建议确认")),
+                        + ("可清理" if risk == RiskLevel.LOW else "可能仍在使用，建议确认") + big_hint),
                 priority=self.priority,
             )
         return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
+
+class UnfinishedDownloadRule(BaseRule):
+    """未完成下载（.crdownload/.part 等） -> 低风险（但仅对较旧者）"""
+    name = "UnfinishedDownload"
+    priority = 72
+
+    def apply(self, fi: FileInfo) -> RuleResult:
+        if fi.extension not in (".crdownload", ".part", ".partial", ".download"):
+            return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
+        days = fi.mtime_days_ago
+        # 太新的可能是正在下载，不建议清理
+        if days <= 7:
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.MEDIUM,
+                category=FileCategory.DOWNLOAD,
+                reason=f"未完成下载文件（{fi.extension}），最近 {days} 天内仍修改，可能仍在下载，建议确认",
+                priority=self.priority,
+            )
+        return RuleResult(
+            matched=True,
+            risk_level=RiskLevel.LOW,
+            category=FileCategory.TEMP,
+            reason=f"未完成下载文件（{fi.extension}），超过 {days} 天未修改，通常可清理",
+            priority=self.priority,
+        )
 
 
 class MediumRiskExtensionRule(BaseRule):
@@ -329,13 +568,20 @@ class InstallerRule(BaseRule):
         in_downloads = os.path.normcase(fi.path).startswith(
             os.path.normcase(DOWNLOADS_DIR)
         )
-        risk = RiskLevel.MEDIUM
         location = "下载目录" if in_downloads else "非下载目录"
+        # 下载目录的时间维度：越新越需要确认，越旧越“更接近可清理”
+        days = fi.mtime_days_ago
+        if in_downloads and days <= 7:
+            hint = "近期下载，建议确认安装完成后再删除"
+        elif in_downloads and days >= 90:
+            hint = "下载目录中已放置较久（>90天），更可能可清理，但仍建议确认"
+        else:
+            hint = "较早下载，建议确认后清理"
         return RuleResult(
             matched=True,
-            risk_level=risk,
+            risk_level=RiskLevel.MEDIUM,
             category=FileCategory.INSTALLER,
-            reason=f"安装包文件，位于{location}，请确认程序已安装后再删除",
+            reason=f"安装包文件，位于{location}，{hint}",
             priority=self.priority,
         )
 
@@ -351,11 +597,21 @@ class ArchiveInDownloadsRule(BaseRule):
         if not os.path.normcase(fi.path).startswith(os.path.normcase(DOWNLOADS_DIR)):
             return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
 
+        days = fi.mtime_days_ago
+        # 旁边存在“同名解压目录”时给出提示（仍中风险，避免误删）
+        try:
+            base = os.path.splitext(fi.name)[0]
+            parent = os.path.dirname(fi.path)
+            extracted_dir = os.path.join(parent, base)
+            extracted_hint = "；旁边存在同名目录，可能已解压" if os.path.isdir(extracted_dir) else ""
+        except Exception:
+            extracted_hint = ""
+        hint = "近期下载，建议确认已解压/使用后再删除" if days <= 7 else "较早下载，建议确认已解压或不再需要后删除"
         return RuleResult(
             matched=True,
             risk_level=RiskLevel.MEDIUM,
             category=FileCategory.ARCHIVE,
-            reason="下载目录中的压缩包，请确认已解压或不再需要后删除",
+            reason=f"下载目录中的压缩包，{hint}{extracted_hint}",
             priority=self.priority,
         )
 
@@ -401,13 +657,26 @@ class OldFileRule(BaseRule):
     priority = 40
 
     def apply(self, fi: FileInfo) -> RuleResult:
-        days = fi.atime_days_ago
+        # Windows 上 atime 可能不可靠：改为 mtime 为主、atime 为辅，并结合文件类型
+        m_days = getattr(fi, "mtime_days_ago", 0)
+        a_days = getattr(fi, "atime_days_ago", 0)
+
+        if fi.extension in LOG_EXTENSIONS and m_days >= 30:
+            return RuleResult(
+                matched=True,
+                risk_level=RiskLevel.LOW,
+                category=FileCategory.LOG,
+                reason=f"日志文件超过 {m_days} 天未修改，通常可清理（近期仍在写入则不建议）",
+                priority=self.priority,
+            )
+
+        days = max(m_days, a_days)
         if days >= VERY_OLD_FILE_DAYS:
             return RuleResult(
                 matched=True,
                 risk_level=RiskLevel.MEDIUM,
                 category=FileCategory.OLD_FILE,
-                reason=f"超过 {days} 天未被访问，可能不再需要",
+                reason=f"超过 {days} 天未修改/访问，可能不再需要",
                 priority=self.priority,
             )
         elif days >= OLD_FILE_DAYS:
@@ -415,7 +684,7 @@ class OldFileRule(BaseRule):
                 matched=True,
                 risk_level=RiskLevel.MEDIUM,
                 category=FileCategory.OLD_FILE,
-                reason=f"超过 {days} 天未被访问，建议确认",
+                reason=f"超过 {days} 天未修改/访问，建议确认",
                 priority=self.priority,
             )
         return RuleResult(matched=False, risk_level=None, category=None, reason="", priority=0)
@@ -441,7 +710,7 @@ class HighRiskExtensionRule(BaseRule):
 class MediaFileRule(BaseRule):
     """媒体文件 -> 高风险（防止误删珍贵照片/视频）"""
     name = "MediaFile"
-    priority = 35
+    priority = 55
 
     def apply(self, fi: FileInfo) -> RuleResult:
         if fi.extension in MEDIA_EXTENSIONS:
@@ -458,7 +727,7 @@ class MediaFileRule(BaseRule):
 class DocumentFileRule(BaseRule):
     """文档文件 -> 高风险"""
     name = "DocumentFile"
-    priority = 35
+    priority = 55
 
     def apply(self, fi: FileInfo) -> RuleResult:
         if fi.extension in DOCUMENT_EXTENSIONS:
@@ -485,14 +754,19 @@ class RuleEngine:
 
     DEFAULT_RULES: List[BaseRule] = [
         SystemDirectoryRule(),
+        SyncDriveRule(),
+        WindowsUserDataProtectionRule(),
+        SensitiveConfigRule(),
         HighRiskExtensionRule(),
         KnownTempDirRule(),
+        DevToolCacheRule(),
         MediumRiskCacheRule(),
         KnownCacheDirRule(),
         DuplicateFileRule(),
         LowRiskExtensionRule(),
         LogFileRule(),
         LogDirHeuristicRule(),
+        UnfinishedDownloadRule(),
         InstallerRule(),
         ArchiveInDownloadsRule(),
         MediumRiskExtensionRule(),
@@ -511,23 +785,57 @@ class RuleEngine:
             reverse=True,  # 高优先级先匹配
         )
 
-    def apply(self, fi: FileInfo) -> Tuple[RiskLevel, FileCategory, str]:
+    def apply(self, fi: FileInfo) -> Tuple[RiskLevel, FileCategory, str, List[str]]:
         """
         对单个文件应用所有规则。
 
         返回: (risk_level, category, reason)
         """
-        best: Optional[RuleResult] = None
+        # 策略明确化：
+        # - “系统关键目录 / 高风险扩展名”属于绝对高风险保护，必须优先生效且不可被覆盖
+        # - 其他规则在此保护之外按优先级选取最优匹配（不再用 priority>=80 这种隐式短路）
+        hits: List[str] = []
 
+        try:
+            sys_rule = SystemDirectoryRule()
+            r0 = sys_rule.apply(fi)
+            if r0.matched:
+                hits.append(r0.reason)
+                return r0.risk_level, r0.category, r0.reason, hits
+        except Exception as e:
+            self._log_rule_error(SystemDirectoryRule(), fi, e)
+
+        # 同步盘/敏感配置：高风险优先且不可被覆盖
+        for abs_rule in (SyncDriveRule(), WindowsUserDataProtectionRule(), SensitiveConfigRule()):
+            try:
+                rr = abs_rule.apply(fi)
+                if rr.matched:
+                    hits.append(rr.reason)
+                    return rr.risk_level, rr.category, rr.reason, hits
+            except Exception as e:
+                self._log_rule_error(abs_rule, fi, e)
+
+        try:
+            hr_rule = HighRiskExtensionRule()
+            r1 = hr_rule.apply(fi)
+            if r1.matched:
+                hits.append(r1.reason)
+                return r1.risk_level, r1.category, r1.reason, hits
+        except Exception as e:
+            self._log_rule_error(HighRiskExtensionRule(), fi, e)
+
+        best: Optional[RuleResult] = None
         for rule in self.rules:
+            # 跳过已显式处理的绝对规则
+            if isinstance(rule, (SystemDirectoryRule, HighRiskExtensionRule)):
+                continue
             try:
                 result = rule.apply(fi)
                 if result.matched:
+                    if result.reason:
+                        hits.append(result.reason)
                     if best is None or result.priority > best.priority:
                         best = result
-                    # 高优先级规则直接采用（SystemDirectory/HighRiskExtension）
-                    if result.priority >= 80:
-                        break
             except Exception as e:
                 self._log_rule_error(rule, fi, e)
 
@@ -536,10 +844,11 @@ class RuleEngine:
             return (
                 RiskLevel.HIGH,
                 FileCategory.UNKNOWN,
-                "未能识别文件用途，保守标记为高风险，建议使用 AI 分析后再决定",
+                "未能识别文件用途，保守标记为高风险，建议使用智能分析后再决定",
+                hits,
             )
 
-        return best.risk_level, best.category, best.reason
+        return best.risk_level, best.category, best.reason, hits
 
     @staticmethod
     def _log_rule_error(rule: BaseRule, fi: FileInfo, err: Exception) -> None:
@@ -557,10 +866,11 @@ class RuleEngine:
     def apply_all(self, files: List[FileInfo]) -> None:
         """批量应用规则，直接修改 FileInfo 对象"""
         for fi in files:
-            risk, cat, reason = self.apply(fi)
+            risk, cat, reason, hits = self.apply(fi)
             fi.risk_level  = risk.value
             fi.category    = cat.value
             fi.risk_reason = reason
+            fi.rule_hits   = hits
             # 高风险文件默认不选中
             if risk == RiskLevel.HIGH:
                 fi.selected = False

@@ -1,22 +1,21 @@
 """
 api_client.py - 统一 HTTP 客户端层
 
-移植自 claude-code-best 的核心设计思路：
   - src/services/api/withRetry.ts  — 应用层重试、指数退避 + jitter、529 独立上限
   - src/services/api/errorUtils.ts — SSL 错误码链遍历、HTML 错误页脱敏
   - src/services/api/errors.ts     — API 错误分类、上下文溢出解析
   - src/services/api/client.ts     — x-client-request-id 请求追踪注入
 
-关键移植要点：
-1. 异常分类体系含 OverloadedError (529) 专用类（源自 withRetry.ts is529Error）
+关键要点：
+1. 异常分类体系含 OverloadedError (529) 专用类
 2. x-client-request-id 注入，每请求生成 UUID，与 request_id 关联排障
-3. SSL 错误码枚举 + 异常因果链遍历（Python __cause__/__context__，对应 TS cause 链）
-4. HTML 错误页脱敏（CloudFlare / 网关错误页提取 <title>，对应 sanitizeMessageHTML）
-5. 上下文溢出解析（"prompt is too long: X tokens > Y maximum"，对应 parsePromptTooLongTokenCounts）
+3. SSL 错误码枚举 + 异常因果链遍历
+4. HTML 错误页脱敏
+5. 上下文溢出解析
 6. RetryClient：BASE_DELAY_S * 2^attempt + jitter，MAX_529_RETRIES 独立封顶
-7. Retry-After 响应头解析，优先遵从服务端指示（对应 getRetryAfterMs）
+7. Retry-After 响应头解析，优先遵从服务端指示
 8. 不可重试错误（401/403/404）立即终止，不消耗重试配额
-9. maxRetries=0 on SDK / 应用层接管重试 —— 与 claude-code-best getAnthropicClient maxRetries:0 同理
+9. maxRetries=0 on SDK / 应用层接管重试 
 """
 import json
 import re

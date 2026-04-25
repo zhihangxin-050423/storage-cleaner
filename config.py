@@ -65,9 +65,20 @@ SYSTEM_CRITICAL_DIRS = list(filter(None, [
     _nc(_env.get("SystemRoot",   r"C:\Windows")),
     _nc(_env.get("ProgramFiles", r"C:\Program Files")),
     _nc(_env.get("ProgramW6432", r"C:\Program Files")),
+    _nc(_env.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
     _nc(r"C:\ProgramData\Microsoft"),
     _nc(r"C:\ProgramData\Windows"),
+    _nc(r"C:\Windows\System32\drivers"),
 ]))
+
+# 同步盘目录（默认更保守，避免误删同步到云端）
+SYNC_DRIVE_DIR_NAMES = {
+    "onedrive", "onedrivecommercial", "onedriveconsumer",
+    "nutstore", "jianguoyun",
+    "baidunetdisk", "baidu netdisk",
+    "dropbox", "google drive", "gdrive",
+    "tencent weiyun", "weiyun",
+}
 
 # 已知临时/缓存目录（低风险）
 _local = _env.get("LOCALAPPDATA", "")
@@ -192,6 +203,12 @@ HIGH_RISK_EXTENSIONS: Set[str] = {
     '.reg', '.bat', '.cmd', '.ps1', '.vbs', '.wsf',
     '.dat', '.db', '.sqlite', '.sqlite3', '.mdb', '.accdb',
     '.pem', '.key', '.pfx', '.p12', '.cer', '.crt',
+    '.env', '.yaml', '.yml', '.toml', '.properties',
+    '.kubeconfig', '.npmrc', '.pypirc', '.gitconfig',
+    # 密钥库/钱包/VPN/远程连接配置（小文件也高风险）
+    '.jks', '.keystore', '.kdbx', '.ppk', '.ovpn', '.rdp',
+    '.der', '.csr',
+    '.tfstate', '.tfvars',
 }
 
 MEDIA_EXTENSIONS: Set[str] = {

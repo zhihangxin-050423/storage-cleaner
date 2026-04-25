@@ -625,6 +625,16 @@ class StorageCleanerApp:
         if self._scanning:
             return
 
+        # 新任务开始：清空取消标记（避免上一轮取消残留）
+        try:
+            self.scanner.reset_cancel()
+        except Exception:
+            # 兼容旧版本 Scanner
+            try:
+                self.scanner._cancel_flag.clear()
+            except Exception:
+                pass
+
         self._scanning = True
         self._scan_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
@@ -741,6 +751,58 @@ class StorageCleanerApp:
             self._scan_phase = ""
             self._status_var.set(f"扫描出错: {err}")
             messagebox.showerror("扫描错误", err)
+
+        elif mtype == "ai_done":
+            # 兼容新旧消息格式：
+            # - 旧：("ai_done", fi, explanation)
+            # - 新：("ai_done", fi, explanation, meta)
+            _, fi, explanation, *rest = msg
+            meta = rest[0] if rest else {}
+            fi.ai_explanation = explanation
+            self._set_ai_text(explanation)
+            try:
+                # 失败时显示 request_id（优先用 meta，其次用 explainer 属性）
+                if isinstance(explanation, str) and ("解释生成失败" in explanation or "AI 分析失败" in explanation):
+                    rid = ""
+                    if isinstance(meta, dict):
+                        rid = str(meta.get("request_id") or "").strip()
+                    if not rid:
+                        rid = (getattr(self.explainer, "last_request_id", "") or "").strip()
+                    if rid:
+                        self._status_var.set(f"AI 调用失败（request_id: {rid}），可复制该 id 用于排查")
+            except Exception:
+                pass
+            if self._selected_file and self._selected_file.path == fi.path:
+                self._show_file_detail(fi)
+            self._ai_btn.configure(state="normal")
+
+        elif mtype == "batch_ai_done":
+            _, count = msg
+            self._set_ai_text(f"AI 分析完成，共分析 {count} 个文件。\n请选中文件查看各自解释。")
+
+        elif mtype == "batch_ai_progress":
+            _, done, total = msg
+            self._set_ai_text(f"批量 AI 分析中：{done}/{total} ...")
+
+        elif mtype == "exec_done":
+            _, result, processed_files = msg
+            self._trash_btn.configure(state="normal")
+            self._delete_btn.configure(state="normal")
+            self._status_var.set(f"执行完成 | {result.summary}")
+
+            success_set = set(result.success_paths)
+            self.all_files = [fi for fi in self.all_files if fi.path not in success_set]
+            self._refresh_file_list()
+            self._refresh_log()
+
+            msg_text = (f"操作完成！\n\n"
+                        f"成功: {len(result.success_paths)} 个\n"
+                        f"跳过: {len(result.skipped_paths)} 个\n"
+                        f"失败: {len(result.failed_paths)} 个\n"
+                        f"释放空间: {result.freed_str}")
+            if result.failed_paths:
+                msg_text += f"\n\n失败文件:\n" + "\n".join(result.failed_paths[:5])
+            messagebox.showinfo("执行结果", msg_text)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 扫描完成后更新 UI
@@ -947,6 +1009,13 @@ class StorageCleanerApp:
             f"访问时间：{datetime.fromtimestamp(fi.atime).strftime('%Y-%m-%d %H:%M')} "
             f"({_days_str(fi.atime_days_ago)})\n"
         )
+        # 多条命中证据（除主原因外）
+        hits = getattr(fi, "rule_hits", None)
+        if isinstance(hits, list) and hits:
+            extra = [h for h in hits if isinstance(h, str) and h.strip() and h.strip() != (fi.risk_reason or "").strip()]
+            extra = extra[:5]
+            if extra:
+                text += "其他命中证据：\n" + "\n".join([f"- {x}" for x in extra]) + "\n"
         # 更新 AI 标签
         sug = (getattr(fi, "ai_suggestion", "") or "").strip()
         conf = float(getattr(fi, "ai_confidence", 0.0) or 0.0)
@@ -1009,7 +1078,7 @@ class StorageCleanerApp:
         self._refresh_file_list()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # AI 解释
+    # 智能解释
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_ai_explanation(self):
@@ -1025,7 +1094,12 @@ class StorageCleanerApp:
 
         def worker():
             result = self.explainer.explain_file(fi)
-            self._q.put(("ai_done", fi, result))
+            meta = {}
+            try:
+                meta = dict(getattr(self.explainer, "last_call_meta", {}) or {})
+            except Exception:
+                meta = {}
+            self._q.put(("ai_done", fi, result, meta))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1172,82 +1246,10 @@ class StorageCleanerApp:
     # 消息处理（补充）
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _handle_message(self, msg):
-        mtype = msg[0]
-        if mtype == "progress":
-            _, count, size, path = msg
-            short = path[-60:] if len(path) > 60 else path
-            self._status_var.set(f"扫描中: {count} 个文件 | {_fmt_size(size)} | {short}")
-            self._file_count_var.set(f"{count} 文件")
-
-        elif mtype == "scan_done":
-            _, result, summary = msg
-            self.scan_result = result
-            self.summary     = summary
-            self.all_files   = result.files
-            self._scanning   = False
-            self._scan_btn.configure(state="normal")
-            self._cancel_btn.configure(state="disabled")
-            self._progress.stop()
-            self._progress.pack_forget()
-            self._on_scan_complete(result, summary)
-
-        elif mtype == "scan_error":
-            _, err = msg
-            self._scanning = False
-            self._scan_btn.configure(state="normal")
-            self._cancel_btn.configure(state="disabled")
-            self._progress.stop()
-            self._progress.pack_forget()
-            self._status_var.set(f"扫描出错: {err}")
-            messagebox.showerror("扫描错误", err)
-
-        elif mtype == "ai_done":
-            _, fi, explanation = msg
-            fi.ai_explanation = explanation
-            self._set_ai_text(explanation)
-            # 如果本次 AI 调用失败/报错，在状态栏给出 request_id 便于排障
-            try:
-                if isinstance(explanation, str) and ("解释生成失败" in explanation or "AI 分析失败" in explanation):
-                    rid = (getattr(self.explainer, "last_request_id", "") or "").strip()
-                    if rid:
-                        self._status_var.set(f"AI 调用失败（request_id: {rid}），可复制该 id 用于排查")
-            except Exception:
-                pass
-            # 同步刷新详情区 AI 标签
-            if self._selected_file and self._selected_file.path == fi.path:
-                self._show_file_detail(fi)
-            self._ai_btn.configure(state="normal")
-
-        elif mtype == "batch_ai_done":
-            _, count = msg
-            self._set_ai_text(f"AI 分析完成，共分析 {count} 个文件。\n请选中文件查看各自解释。")
-
-        elif mtype == "batch_ai_progress":
-            _, done, total = msg
-            self._set_ai_text(f"批量 AI 分析中：{done}/{total} ...")
-
-        elif mtype == "exec_done":
-            _, result, processed_files = msg
-            self._trash_btn.configure(state="normal")
-            self._delete_btn.configure(state="normal")
-            self._status_var.set(f"执行完成 | {result.summary}")
-
-            # 从列表中移除成功处理的文件
-            success_set = set(result.success_paths)
-            self.all_files = [fi for fi in self.all_files
-                              if fi.path not in success_set]
-            self._refresh_file_list()
-            self._refresh_log()
-
-            msg_text = (f"操作完成！\n\n"
-                        f"成功: {len(result.success_paths)} 个\n"
-                        f"跳过: {len(result.skipped_paths)} 个\n"
-                        f"失败: {len(result.failed_paths)} 个\n"
-                        f"释放空间: {result.freed_str}")
-            if result.failed_paths:
-                msg_text += f"\n\n失败文件:\n" + "\n".join(result.failed_paths[:5])
-            messagebox.showinfo("执行结果", msg_text)
+    # 历史遗留：文件中曾有重复定义的 _handle_message，这里保留为兼容定位，但不再使用。
+    # 注意：Python 会以后定义覆盖先定义，重复定义会导致上面的进度/scan_total 等逻辑失效。
+    def _handle_message_legacy(self, msg):
+        return self._handle_message(msg)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 其他功能
@@ -1328,24 +1330,8 @@ class StorageCleanerApp:
         self._detail_text.configure(state="disabled")
         self._set_ai_text("")
 
-    def _refresh_log(self):
-        for row in self._log_tree.get_children():
-            self._log_tree.delete(row)
-        records = self.executor.get_operation_log()[-200:]
-        records.reverse()
-        for rec in records:
-            tag = "success" if rec.get("success") else (
-                  "skip" if rec.get("action") == "skip" else "error")
-            action_cn = {"trash": "回收站", "delete": "永久删除", "symlink": "软链接",
-                         "skip": "跳过", "error": "失败"}.get(rec.get("action",""), "?")
-            result_str = "✓" if rec.get("success") else "✗"
-            self._log_tree.insert("", "end", tags=(tag,),
-                values=(rec.get("timestamp", ""), action_cn,
-                        rec.get("file_name", ""),
-                        _fmt_size(rec.get("file_size", 0)),
-                        rec.get("risk_level", ""),
-                        result_str,
-                        rec.get("file_path", "")))
+    def _refresh_log_legacy(self):
+        return self._refresh_log()
 
     def _clear_log(self):
         if messagebox.askyesno("确认", "确定要清除所有操作日志吗？"):

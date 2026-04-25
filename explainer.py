@@ -1,7 +1,6 @@
 """
 explainer.py - 大模型解释生成模块
 
-改进要点（基于 claude-code-best 设计模式）：
 1) Prompt 分层：system/user 分离，结构化 JSON 输出
 2) 上下文优化：规则引擎结论、目录语义、重复文件信息；避免泄露完整路径隐私
 3) 批量策略：智能分批 + (可配置)并发 + 指数退避重试
@@ -231,10 +230,12 @@ class Explainer:
         self.api_key: str = api_key or self._default_api_key_for_provider(self.provider)
         # OpenAI/DeepSeek 等兼容接口的额外请求参数（可选，JSON）
         self.extra_params: Dict = extra_params or {}
-        self.last_error: str = ""
-        self.last_request_id: str = ""
-        self.last_error_kind: str = ""  # auth | model_not_found | rate_limit | overloaded | context_overflow | timeout | network | other
-        self.last_call_meta: Dict[str, object] = {}  # request_id/latency/usage/finish_reason/provider/model
+        self._tls = threading.local()
+        # 初始化线程局部状态（避免批量并发时 last_* 串台）
+        self.last_error = ""
+        self.last_request_id = ""
+        self.last_error_kind = ""
+        self.last_call_meta = {}
 
         self._cache = ExplainerCache(_CACHE_PATH)
         # system prompt 缓存：静态段落 + 动态段落（跨请求稳定，减少细微波动）
@@ -568,6 +569,14 @@ class Explainer:
             if self._estimate_tokens(" | ".join(parts)) + 20 < token_budget:
                 parts.append(f"规则:{reason_short}")
 
+        # 多命中证据（供 AI 更准地解释）；只取前 3 条，避免 prompt 变长
+        hits = getattr(fi, "rule_hits", None)
+        if isinstance(hits, list) and hits:
+            slim = [str(x).strip() for x in hits if str(x).strip()]
+            slim = slim[:3]
+            if slim and self._estimate_tokens(" | ".join(parts)) + 28 < token_budget:
+                parts.append("证据:" + "；".join(slim)[:60])
+
         if self._estimate_tokens(" | ".join(parts)) + 12 < token_budget:
             parts.append(f"访问:{fi.atime_days_ago}天前")
 
@@ -669,6 +678,63 @@ class Explainer:
             self.last_error = str(e)[:200] if str(e) else "未知错误"
             self.last_error_kind = "other"
         return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Thread-local last_* (避免并发串台)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _tls_get(self, key: str, default):
+        if not hasattr(self._tls, "state"):
+            self._tls.state = {
+                "last_error": "",
+                "last_request_id": "",
+                "last_error_kind": "",
+                "last_call_meta": {},
+            }
+        return self._tls.state.get(key, default)
+
+    def _tls_set(self, key: str, value):
+        if not hasattr(self._tls, "state"):
+            self._tls.state = {
+                "last_error": "",
+                "last_request_id": "",
+                "last_error_kind": "",
+                "last_call_meta": {},
+            }
+        self._tls.state[key] = value
+
+    @property
+    def last_error(self) -> str:
+        return str(self._tls_get("last_error", ""))
+
+    @last_error.setter
+    def last_error(self, v: str):
+        self._tls_set("last_error", str(v or ""))
+
+    @property
+    def last_request_id(self) -> str:
+        return str(self._tls_get("last_request_id", ""))
+
+    @last_request_id.setter
+    def last_request_id(self, v: str):
+        self._tls_set("last_request_id", str(v or ""))
+
+    @property
+    def last_error_kind(self) -> str:
+        return str(self._tls_get("last_error_kind", ""))
+
+    @last_error_kind.setter
+    def last_error_kind(self, v: str):
+        self._tls_set("last_error_kind", str(v or ""))
+
+    @property
+    def last_call_meta(self) -> Dict[str, object]:
+        val = self._tls_get("last_call_meta", {})
+        return val if isinstance(val, dict) else {}
+
+    @last_call_meta.setter
+    def last_call_meta(self, v):
+        self._tls_set("last_call_meta", v if isinstance(v, dict) else {})
 
     def _call_with_messages(self, system: str, user: str, max_tokens: int) -> Optional[str]:
         # 不捕获异常：让 APIError 子类传播到 RetryClient 进行重试决策

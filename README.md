@@ -15,6 +15,7 @@ storage_cleaner/
 ├── main.py          # 程序入口，依赖检查，启动 Tkinter UI
 ├── config.py        # 全局配置：Windows 路径、风险类别、阈值、LLM 默认值、日志路径
 ├── scanner.py       # 文件扫描：递归遍历、元数据收集、目录统计、MD5 查重
+├── path_matcher.py  # 路径匹配工具：按目录段/连续片段识别缓存、构建目录、浏览器 Profile
 ├── rule_engine.py   # 规则引擎：基于路径/扩展名/时间/大小等做风险分类
 ├── risk_assessor.py # 汇总统计：风险大小、分类统计、重复文件浪费空间
 ├── api_client.py    # 统一 HTTP 客户端：错误分类、重试、request_id、SSE 简化解析
@@ -27,6 +28,7 @@ storage_cleaner/
 | 模块 | 主要职责 | 是否直接删除文件 |
 |------|----------|------------------|
 | `scanner.py` | 扫描文件系统，收集文件元数据，检测重复文件 | 否 |
+| `path_matcher.py` | 提供结构化路径匹配，减少简单字符串匹配带来的误判/漏判 | 否 |
 | `rule_engine.py` | 按可解释规则分类文件并给出风险等级 | 否 |
 | `risk_assessor.py` | 生成总大小、风险大小、分类统计、重复浪费空间 | 否 |
 | `api_client.py` | 封装 LLM HTTP 请求、错误分类、重试与 request_id | 否 |
@@ -91,7 +93,14 @@ python main.py
 3. 大于 `PARTIAL_HASH_THRESHOLD` 的文件先使用首尾片段 + 文件大小做筛选哈希。
 4. 大文件候选重复组再计算全量 MD5 二次确认。
 
-重复组中保留第一份为原始文件，其余副本标记为“重复文件 / 中风险”。
+重复组不会简单按扫描顺序决定保留项，而是使用启发式打分选择更适合保留的文件：
+
+- 优先保留桌面、文档、图片、视频等用户数据目录中的副本。
+- 优先删除下载、临时、缓存目录中的副本。
+- 文件名包含 `copy`、`副本`、`复制`、`(1)`、`重复` 等特征时更倾向于判定为副本。
+- 修改时间较新、路径较短的文件会获得轻微保留倾向。
+
+最终保留项作为重复源文件，其余副本标记为“重复文件 / 中风险”。
 
 ### 3. 风险分级
 
@@ -99,33 +108,54 @@ python main.py
 |----------|----------|--------------|----------|
 | 低风险 | 临时文件、缓存文件、较旧日志、已知缓存目录 | 默认选中 | 可以优先清理 |
 | 中风险 | 重复副本、大文件、安装包、压缩包、备份、构建产物、长期未访问文件 | 默认选中 | 建议人工确认 |
-| 高风险 | 系统目录文件、配置/脚本/证书/数据库、文档、照片、视频、未知文件 | 默认不选中 | 默认跳过，不自动删除 |
+| 高风险 | 系统目录文件、同步盘文件、敏感配置/密钥、配置/脚本/证书/数据库、文档、照片、视频、未知文件 | 默认不选中 | 默认跳过，不自动删除 |
 
 未知文件会被保守标记为高风险，建议先查看详情或使用智能分析。
 
 ### 4. 规则引擎
 
-当前规则引擎包含 18 类规则，全部基于本地可解释条件，不依赖大语言模型。
+当前规则引擎包含 23 类规则，全部基于本地可解释条件，不依赖大语言模型。
+
+规则处理策略：
+
+- 系统关键目录、同步盘、Windows 用户核心数据、敏感配置和高风险扩展名属于绝对保护规则，命中后直接标记为高风险。
+- 其他规则会继续收集全部命中证据，并选择优先级最高的一条作为最终分类。
+- 命中的多条规则原因会写入 `FileInfo.rule_hits`，文件详情和 AI 上下文可展示这些证据。
+- 未知文件默认归类为“未知文件 / 高风险”，需要用户或 AI 进一步确认。
 
 | 规则 | 典型条件 | 风险/类别 |
 |------|----------|-----------|
 | `SystemDirectoryRule` | 系统关键目录 | 高风险 / 系统文件 |
+| `SyncDriveRule` | OneDrive、坚果云、百度网盘、Dropbox、Google Drive、微云等同步盘目录 | 高风险 / 配置文件 |
+| `WindowsUserDataProtectionRule` | `AppData\Local\Microsoft\Windows`、`AppData\Roaming\Microsoft\Windows` | 高风险 / 系统文件 |
+| `SensitiveConfigRule` | `.ssh\config`、`known_hosts`、`authorized_keys`、私钥文件等 | 高风险 / 配置文件 |
+| `HighRiskExtensionRule` | `.dll`、`.sys`、`.reg`、`.db`、`.key`、`.env`、`.tfstate` 等 | 高风险 / 配置或系统关键文件 |
 | `KnownTempDirRule` | `%TEMP%`、`AppData\Local\Temp` 等 | 低风险 / 临时文件 |
-| `KnownCacheDirRule` | Chrome、Edge、VS Code、npm、pip、JetBrains 等缓存路径 | 低风险 / 缓存文件 |
+| `KnownCacheDirRule` | Chrome/Edge 多 Profile、Firefox `cache2`、VS Code、npm、pip、JetBrains 等缓存路径 | 低风险 / 缓存文件 |
+| `DevToolCacheRule` | `.vite`、`.turbo`、`.parcel-cache`、`.ruff_cache`、`cmake-build-*`、Go/Rust/Python 工具缓存等 | 中风险 / 缓存文件 |
 | `MediumRiskCacheRule` | `.gradle`、`.m2`、`.cargo`、`.nuget`、`conda\pkgs` 等 | 中风险 / 缓存文件 |
 | `BuildArtifactRule` | `dist`、`build`、`target`、`.next`、`coverage` 等 | 中风险 / 缓存文件 |
 | `DuplicateFileRule` | MD5 确认相同的重复副本 | 中风险 / 重复文件 |
 | `LowRiskExtensionRule` | `.tmp`、`.cache`、`.dmp`、`.crdownload` 等 | 低风险 / 临时文件 |
 | `LogFileRule` / `LogDirHeuristicRule` | 日志扩展名或 `log/logs` 目录 | 低/中风险 / 日志文件 |
+| `UnfinishedDownloadRule` | `.crdownload`、`.part`、`.partial`、`.download` | 低/中风险 / 下载或临时文件 |
 | `InstallerRule` | `.exe`、`.msi`、`.iso` 等安装包 | 中风险 / 安装包 |
 | `ArchiveInDownloadsRule` | 下载目录中的压缩包 | 中风险 / 压缩包 |
 | `MediumRiskExtensionRule` | `.bak`、`.old`、`.backup` 等 | 中风险 / 临时/备份文件 |
 | `AppResidualRule` | Recent、缩略图缓存、Cookie 等应用残留路径 | 中风险 / 应用残留 |
 | `LargeFileRule` | 大于 `LARGE_FILE_THRESHOLD` | 中风险 / 大文件 |
-| `OldFileRule` | 超过 365/730 天未访问 | 中风险 / 长期未访问 |
-| `HighRiskExtensionRule` | `.dll`、`.sys`、`.reg`、`.db`、`.key` 等 | 高风险 / 配置或系统关键文件 |
+| `OldFileRule` | 超过 365/730 天未修改或未访问；旧日志会更偏向低风险 | 低/中风险 / 长期未访问或日志 |
 | `MediaFileRule` | 图片、音频、视频 | 高风险 / 媒体文件 |
 | `DocumentFileRule` | PDF、Office、Markdown、CSV 等 | 高风险 / 文档文件 |
+
+
+`path_matcher.py` 提供结构化路径匹配能力，避免仅靠 `frag in path` 判断：
+
+- 按目录段判断：例如 `dist`、`build`、`.next`、`target`。
+- 按连续目录片段判断：例如 `node_modules\.cache`、`go\pkg\mod`。
+- 识别 Chromium 多 Profile 缓存：`Default`、`Profile 1`、`Profile 2` 等。
+- 识别 Firefox Profiles 缓存：`Profiles\*\cache2`。
+- 识别 `cmake-build-*` 等前缀型构建目录。
 
 ---
 
@@ -144,12 +174,14 @@ python main.py
 
 - 单文件解释：输出来源、功能、删除影响、建议、置信度。
 - 批量分析未知文件：按风险和文件类型智能分批。
+- 规则证据上下文：AI 请求会包含本地规则命中证据、目录上下文、重复源文件等关键信息。
 - 本地缓存：相似文件解释缓存 30 天，最多 5000 条，缓存文件为 `logs/explain_cache_v2.json`。
 - JSON 容错：支持代码块包裹、前后缀、部分 JSON 提取。
 - 截断恢复：单文件和批量分析遇到疑似截断 JSON 时，会尝试一次“JSON 修复”请求。
 - 上下文超限恢复：批量分析遇到上下文超限时，会自动二分拆批重试。
 - 动态并发降级：批量调用遇到 429/529 时会降低并发并短暂退避。
-- 请求诊断：记录 `last_request_id`、`last_error_kind`、`last_call_meta`，方便排查 API 问题。
+- 线程本地诊断：记录 `last_request_id`、`last_error_kind`、`last_call_meta`，并使用线程本地状态降低批量并发时的状态串扰。
+- 额外参数：设置窗口支持填写 JSON 形式的模型额外参数，例如 `reasoning_effort` 或供应商特定 `extra_body`。
 
 ### API Key 配置
 
@@ -219,7 +251,7 @@ DeepSeek 模型下拉当前提供：
 
 - 只支持普通文件，不支持目录或特殊项。
 - 源文件不存在、源文件本身已是链接时会拒绝。
-- 高风险文件、系统关键目录文件、高风险扩展名文件会拒绝。
+- 高风险文件、系统关键目录文件、同步盘文件、高风险扩展名文件会拒绝。
 - `pagefile.sys`、`hiberfil.sys`、`swapfile.sys` 等系统文件会拒绝。
 
 Windows 创建符号链接可能需要开启“开发者模式”或以管理员权限运行。
@@ -245,6 +277,7 @@ Windows 创建符号链接可能需要开启“开发者模式”或以管理员
 - 扫描时间和扫描路径
 - 文件总数和总大小
 - 文件路径、大小、风险等级、类别、规则原因
+- 本地规则命中证据 `rule_hits`
 - AI 解释结果
 - 重复文件信息
 - 最后访问时间等元数据
@@ -260,7 +293,7 @@ Windows 创建符号链接可能需要开启“开发者模式”或以管理员
 - “开始扫描”按钮
 - “取消”按钮
 - “设置”按钮
-- 扫描进度条和状态提示
+- 扫描进度条和状态提示；预统计成功时会切换为确定进度，哈希检测阶段会回到活动进度
 
 ### 标签页
 
@@ -284,7 +317,7 @@ Windows 创建符号链接可能需要开启“开发者模式”或以管理员
 ### 底部操作区
 
 - “获取智能分析报告”：对当前选中文件调用 AI。
-- “批量分析未知文件”：对尚未分析的未知文件批量调用 AI。
+- “批量分析未知文件”：对尚未分析的未知文件批量调用 AI，并显示批量进度。
 - “移至回收站（推荐）”：安全清理，可恢复。
 - “永久删除（不可恢复）”：不可恢复，需要输入 `DELETE`。
 - “创建软链接”：为当前选中文件创建 Windows 符号链接。
@@ -310,6 +343,8 @@ LOG_BASE_DIR           = PROJECT_ROOT / "logs"
 ```
 
 默认模型配置在 `DEFAULT_LLM_MODELS` 中，可通过设置窗口覆盖。
+
+同步盘保护目录名在 `SYNC_DRIVE_DIR_NAMES` 中维护；高风险扩展名、缓存片段、构建目录和开发工具缓存规则可分别在 `config.py` 与 `rule_engine.py` 中扩展。
 
 ---
 
