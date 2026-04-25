@@ -1206,6 +1206,14 @@ class StorageCleanerApp:
             _, fi, explanation = msg
             fi.ai_explanation = explanation
             self._set_ai_text(explanation)
+            # 如果本次 AI 调用失败/报错，在状态栏给出 request_id 便于排障
+            try:
+                if isinstance(explanation, str) and ("解释生成失败" in explanation or "AI 分析失败" in explanation):
+                    rid = (getattr(self.explainer, "last_request_id", "") or "").strip()
+                    if rid:
+                        self._status_var.set(f"AI 调用失败（request_id: {rid}），可复制该 id 用于排查")
+            except Exception:
+                pass
             # 同步刷新详情区 AI 标签
             if self._selected_file and self._selected_file.path == fi.path:
                 self._show_file_detail(fi)

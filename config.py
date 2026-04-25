@@ -260,5 +260,6 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # 允许用户在设置中自定义日志目录；这里提供默认值（目录而不是单文件）
 LOG_BASE_DIR        = PROJECT_ROOT / "logs"
+LOG_DIR             = LOG_BASE_DIR          # 向后兼容别名，供 explainer.py 等模块使用
 OPERATION_LOG_DIR   = LOG_BASE_DIR / "operation"
 OPERATION_LOG_PATH  = OPERATION_LOG_DIR / "operation_log.json"
